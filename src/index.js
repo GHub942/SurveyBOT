@@ -1,4 +1,5 @@
 require('dotenv').config();
+const logger = require('./logger');
 const fs = require('fs');
 const path = require('path');
 const { Client, Collection, GatewayIntentBits, Partials, Events } = require('discord.js');
@@ -16,7 +17,7 @@ for (const file of fs.readdirSync(commandsPath).filter(f => f.endsWith('.js'))) 
 }
 
 client.once(Events.ClientReady, c => {
-  console.log(`✅ Connecté en tant que ${c.user.tag}`);
+  console.log(`✅ Connecté en tant que ${c.user.tag} (logs: ${logger.level})`);
   const { startScheduler } = require('./scheduler');
   startScheduler(c);
 });
@@ -35,7 +36,7 @@ client.on(Events.InteractionCreate, async interaction => {
       await handle(interaction);
     }
   } catch (err) {
-    console.error(err);
+    logger.error(err);
     if (interaction.isRepliable && interaction.isRepliable()) {
       const payload = { content: '❌ Une erreur est survenue.', ephemeral: true };
       if (interaction.deferred || interaction.replied) await interaction.followUp(payload).catch(() => {});
@@ -46,11 +47,11 @@ client.on(Events.InteractionCreate, async interaction => {
 
 client.on(Events.GuildMemberAdd, member => {
   const { onGuildMemberAdd } = require('./events');
-  onGuildMemberAdd(member).catch(console.error);
+  onGuildMemberAdd(member).catch(err => logger.error(err));
 });
 
 if (!process.env.DISCORD_TOKEN) {
-  console.error('❌ DISCORD_TOKEN manquant dans le fichier .env. Copie .env.example vers .env et complète-le.');
+  logger.error('DISCORD_TOKEN manquant dans le fichier .env. Copie .env.example vers .env et complète-le.');
   process.exit(1);
 }
 

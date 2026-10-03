@@ -1,6 +1,7 @@
 const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const db = require('./database');
 const logs = require('./logs');
+const logger = require('./logger');
 
 const CHECK_INTERVAL_MS = 60 * 1000; // vérifie toutes les minutes
 
@@ -25,7 +26,7 @@ async function checkAutoClose(client) {
         );
         await message.edit({ embeds: [embed], components: [row] });
       } catch (err) {
-        console.error(`Impossible de modifier le message de l'enquête ${survey.id} lors de la clôture auto:`, err.message);
+        logger.warn(`Impossible de modifier le message de l'enquête ${survey.id} lors de la clôture auto:`, err.message);
       }
     }
   }
@@ -33,10 +34,10 @@ async function checkAutoClose(client) {
 
 function startScheduler(client) {
   setInterval(() => {
-    checkAutoClose(client).catch(err => console.error('Erreur scheduler clôture auto:', err));
+    checkAutoClose(client).catch(err => logger.error('Erreur scheduler clôture auto:', err));
   }, CHECK_INTERVAL_MS);
   // Vérifie aussi immédiatement au démarrage
-  checkAutoClose(client).catch(err => console.error('Erreur scheduler clôture auto:', err));
+  checkAutoClose(client).catch(err => logger.error('Erreur scheduler clôture auto:', err));
 }
 
 module.exports = { startScheduler };

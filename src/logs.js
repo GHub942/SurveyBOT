@@ -1,4 +1,5 @@
 const db = require('./database');
+const logger = require('./logger');
 
 /**
  * Enregistre une action dans le journal d'audit.
@@ -17,7 +18,7 @@ function log(guildId, actorId, action, details = null) {
       Date.now()
     );
   } catch (err) {
-    console.error('Erreur écriture audit_log:', err);
+    logger.error('Erreur écriture audit_log:', err);
   }
 }
 
@@ -28,36 +29,67 @@ function logFromInteraction(interaction, action, details = null) {
   log(guildId, interaction.user.id, action, details);
 }
 
-function getRecentLogs(guildId, limit = 15, offset = 0) {
-  return db
-    .prepare('SELECT * FROM audit_log WHERE guild_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?')
-    .all(guildId, limit, offset);
+function getRecentLogs(guildId, limit = 15, offset = 0, filters = {}) {
+  const clauses = ['guild_id = ?'];
+  const params = [guildId];
+  if (filters.actorIds && filters.actorIds.length) {
+    clauses.push(`actor_id IN (${filters.actorIds.map(() => '?').join(',')})`);
+    params.push(...filters.actorIds);
+  }
+  if (filters.actions && filters.actions.length) {
+    clauses.push(`action IN (${filters.actions.map(() => '?').join(',')})`);
+    params.push(...filters.actions);
+  }
+  return db.prepare(`SELECT * FROM audit_log WHERE ${clauses.join(' AND ')} ORDER BY created_at DESC LIMIT ? OFFSET ?`).all(...params, limit, offset);
 }
 
-function countLogs(guildId) {
-  return db.prepare('SELECT COUNT(*) c FROM audit_log WHERE guild_id = ?').get(guildId).c;
+function countLogs(guildId, filters = {}) {
+  const clauses = ['guild_id = ?'];
+  const params = [guildId];
+  if (filters.actorIds && filters.actorIds.length) {
+    clauses.push(`actor_id IN (${filters.actorIds.map(() => '?').join(',')})`);
+    params.push(...filters.actorIds);
+  }
+  if (filters.actions && filters.actions.length) {
+    clauses.push(`action IN (${filters.actions.map(() => '?').join(',')})`);
+    params.push(...filters.actions);
+  }
+  return db.prepare(`SELECT COUNT(*) c FROM audit_log WHERE ${clauses.join(' AND ')}`).get(...params).c;
+}
+
+function getDistinctActions(guildId) {
+  return db.prepare('SELECT DISTINCT action FROM audit_log WHERE guild_id = ? ORDER BY action').all(guildId).map(r => r.action);
 }
 
 const ACTION_LABELS = {
   'config.channel': '📨 Salon des réponses modifié',
-  'config.whitelist.add': '👥 Ajout liste blanche',
-  'config.whitelist.remove': '👥 Retrait liste blanche',
   'config.dmjoin.toggle': '👋 MP de bienvenue activé/désactivé',
   'config.dmjoin.message': '👋 Message de bienvenue modifié',
   'broadcast.sent': '📢 MP envoyé',
   'survey.create': '🆕 Enquête créée',
+  'survey.edit': '✏️ Enquête modifiée',
   'survey.publish': '🚀 Enquête publiée',
   'survey.activate': '🔓 Enquête réactivée',
   'survey.deactivate': '🔒 Enquête clôturée',
   'survey.autoclose': '⏰ Enquête clôturée automatiquement',
   'survey.delete': '🗑️ Enquête supprimée',
   'survey.duplicate': '📄 Enquête dupliquée',
-  'survey.export': '📤 Export CSV',
+  'survey.export': '📤 Export effectué',
   'question.add': '➕ Question ajoutée',
   'question.edit': '✏️ Question modifiée',
   'question.delete': '🗑️ Question supprimée',
   'data.user.delete': '🗄️ Données d\'un utilisateur supprimées',
-  'data.survey.clear': '🗄️ Réponses d\'une enquête vidées'
+  'data.user.view': '📄 Réponses d\'un utilisateur consultées',
+  'data.survey.clear': '🗄️ Réponses d\'une enquête vidées',
+  'permissions.toggle': '🔑 Permission modifiée',
+  'permissions.mprestrict': '🎯 Restriction de cible MP modifiée',
+  'permissions.block': '🚫 Blocage d\'un membre modifié',
+  'data.selfdelete': '🗑️ Réponse supprimée par le membre lui-même',
+  'data.selfedit': '✏️ Réponse modifiée par le membre lui-même',
+  'survey.selfdelete.toggle': '🔧 Option de suppression en libre-service modifiée',
+  'survey.selfedit.toggle': '🔧 Option de modification en libre-service modifiée',
+  'survey.archive': '🗄️ Enquête archivée',
+  'survey.unarchive': '📤 Enquête désarchivée'
 };
 
-module.exports = { log, logFromInteraction, getRecentLogs, countLogs, ACTION_LABELS };
+module.exports = { log, logFromInteraction, getRecentLogs, countLogs, getDistinctActions, ACTION_LABELS };

@@ -1,6 +1,3 @@
-const { PermissionFlagsBits } = require('discord.js');
-const db = require('./database');
-
 // Sessions de construction d'enquête (builder) : clé = `${userId}:${guildId}`
 // valeur = { surveyId }
 const builderSessions = new Map();
@@ -33,18 +30,76 @@ const DM_PRESETS = [
 ];
 
 const ANONYMITY_LABELS = {
-  non: '🙂 Non anonyme',
-  choix: '🎭 Anonymat au choix du membre',
-  oui: '🙈 Anonyme total'
+  public: '🌐 Publique (nom visible dans les stats)',
+  semi: '🛡️ Semi-privé (nom visible du staff uniquement)',
+  private: '🙈 Privé (anonyme, réponses illimitées)',
+  choice: '🎭 Au choix (Publique ou Semi-privé)'
 };
 
-function isAuthorized(interaction) {
-  if (interaction.member?.permissions?.has(PermissionFlagsBits.ManageGuild)) return true;
-  const row = db
-    .prepare('SELECT 1 FROM whitelist WHERE guild_id = ? AND user_id = ?')
-    .get(interaction.guildId, interaction.user.id);
-  return !!row;
-}
+// Libellés courts, utilisés là où l'espace est limité (embeds, footers)
+const ANONYMITY_LABELS_SHORT = {
+  public: '🌐 Publique',
+  semi: '🛡️ Semi-privé',
+  private: '🙈 Privé',
+  choice: '🎭 Au choix'
+};
+
+// Brouillons de MP en attente de confirmation : clé = userId
+// valeur = { target, message, recipientsPreview }
+const broadcastDrafts = new Map();
+
+// Filtres actifs du journal d'audit par utilisateur consultant le panneau : clé = userId
+// valeur = { actorId?, action? }
+const logFilters = new Map();
+
+// Modèles d'enquêtes prêts à l'emploi, proposés à la création
+const SURVEY_TEMPLATES = {
+  blank: { label: 'Vierge', emoji: '📄', name: '', description: '', max: '1', questions: [] },
+  satisfaction: {
+    label: 'Satisfaction',
+    emoji: '😊',
+    name: 'Satisfaction générale',
+    description: 'Merci de nous donner votre avis sur votre expérience sur le serveur.',
+    max: '1',
+    questions: [
+      { label: 'Comment évaluez-vous votre satisfaction générale ?', type: 'choix', options: ['Très satisfait', 'Satisfait', 'Neutre', 'Insatisfait', 'Très insatisfait'], required: 1 },
+      { label: "Avez-vous des suggestions d'amélioration ?", type: 'texte', required: 0 }
+    ]
+  },
+  event: {
+    label: 'Feedback événement',
+    emoji: '🎉',
+    name: 'Feedback événement',
+    description: "Ton avis sur l'événement nous intéresse !",
+    max: '1',
+    questions: [
+      { label: 'Note globale sur 10 ?', type: 'nombre', required: 1 },
+      { label: 'Ce que tu as le plus apprécié ?', type: 'texte', required: 0 },
+      { label: "Ce qu'on pourrait améliorer la prochaine fois ?", type: 'texte', required: 0 }
+    ]
+  },
+  quick: {
+    label: 'Sondage rapide',
+    emoji: '⚡',
+    name: 'Sondage rapide',
+    description: '',
+    max: '1',
+    questions: [{ label: 'Es-tu pour ou contre ?', type: 'choix', options: ['Pour', 'Contre', 'Neutre'], required: 1 }]
+  },
+  recrutement: {
+    label: 'Candidature staff',
+    emoji: '🧑‍💼',
+    name: 'Candidature staff',
+    description: 'Merci de répondre à ces quelques questions pour ta candidature.',
+    max: '1',
+    questions: [
+      { label: 'Quel âge as-tu ?', type: 'nombre', required: 1 },
+      { label: 'Depuis quand es-tu sur le serveur ?', type: 'texte', required: 1 },
+      { label: 'Pourquoi souhaites-tu rejoindre le staff ?', type: 'texte', required: 1 },
+      { label: 'Combien de temps peux-tu consacrer par semaine ?', type: 'texte', required: 0 }
+    ]
+  }
+};
 
 function toCsvValue(v) {
   if (v === null || v === undefined) return '';
@@ -78,15 +133,50 @@ function renderBar(pct, width = 14) {
   return '█'.repeat(Math.max(0, Math.min(width, filled))) + '░'.repeat(Math.max(0, width - filled));
 }
 
+// Discord limite la valeur d'un champ d'embed à 1024 caractères : toute valeur
+// dynamique (liste de questions, options, etc.) doit passer par cette fonction
+// avant d'être utilisée dans un .addFields(), sous peine de crash silencieux.
+function truncateField(text, max = 1024) {
+  if (!text) return text;
+  if (text.length <= max) return text;
+  const suffix = '\n… (tronqué)';
+  return text.slice(0, max - suffix.length) + suffix;
+}
+
+// Remplace les variables {user}, {userMention}, etc. dans un message MP.
+// ctx: { username, userId, surveyName, surveyId, surveyPrivacy, serverName }
+const MP_VARIABLES = ['{user}', '{userMention}', '{userId}', '{surveyName}', '{surveyId}', '{surveyPrivacy}', '{serverName}'];
+
+function substituteVariables(text, ctx = {}) {
+  const map = {
+    '{user}': ctx.username || '',
+    '{userMention}': ctx.userId ? `<@${ctx.userId}>` : '',
+    '{userId}': ctx.userId || '',
+    '{surveyName}': ctx.surveyName || '',
+    '{surveyId}': ctx.surveyId != null ? String(ctx.surveyId) : '',
+    '{surveyPrivacy}': ctx.surveyPrivacy || '',
+    '{serverName}': ctx.serverName || ''
+  };
+  let out = text;
+  for (const [k, v] of Object.entries(map)) out = out.split(k).join(v);
+  return out;
+}
+
 module.exports = {
   builderSessions,
   broadcastTargets,
+  broadcastDrafts,
+  logFilters,
   questionDrafts,
   DM_PRESETS,
   ANONYMITY_LABELS,
-  isAuthorized,
+  ANONYMITY_LABELS_SHORT,
+  SURVEY_TEMPLATES,
   toCsvValue,
   chunk,
   parseDateTimeFR,
-  renderBar
+  renderBar,
+  truncateField,
+  substituteVariables,
+  MP_VARIABLES
 };
