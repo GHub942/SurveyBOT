@@ -1,3 +1,4 @@
+const { MessageFlags } = require('discord.js');
 const perms = require('./permissions');
 const panels = require('./panels');
 const flow = require('./responseFlow');
@@ -14,7 +15,7 @@ function checkPermissionForCustomId(interaction, customId) {
   if (customId.startsWith('survey:')) return perms.hasPerm(interaction, perms.PERMS.MANAGE_SURVEYS);
 
   if (customId === 'cfg:back') return perms.hasAnyPerm(interaction);
-  if (customId.startsWith('cfg:perm')) return perms.isServerManager(interaction);
+  if (customId.startsWith('cfg:perm')) return perms.canManagePermissions(interaction);
   if (customId.startsWith('cfg:logs')) return perms.hasPerm(interaction, perms.PERMS.VIEW_LOGS);
   if (customId.startsWith('cfg:data')) return perms.hasPerm(interaction, perms.PERMS.MANAGE_DATA);
   if (customId === 'cfg:welcome' || customId.startsWith('cfg:dmjoin')) return perms.hasPerm(interaction, perms.PERMS.MANAGE_MP_WELCOME);
@@ -49,7 +50,7 @@ async function handle(interaction) {
 
   if (!checkPermissionForCustomId(interaction, customId)) {
     if (interaction.isRepliable()) {
-      await interaction.reply({ content: "❌ Tu n'as pas la permission de faire ça.", ephemeral: true }).catch(() => {});
+      await interaction.reply({ content: "❌ Tu n'as pas la permission de faire ça.", flags: MessageFlags.Ephemeral }).catch(() => {});
     }
     return;
   }
@@ -63,7 +64,8 @@ async function handle(interaction) {
       return interaction.update({ content: null, embeds: [embed], components });
     }
     if (customId === 'cfg:surveys') return panels.showSurveyManagementPanel(interaction);
-    if (customId === 'cfg:surveys:archived') return panels.showSurveyManagementPanel(interaction, 0, true);
+    if (customId === 'cfg:surveys:archived') return panels.showSurveyManagementPanel(interaction, 0, 'archived');
+    if (customId === 'cfg:surveys:templates') return panels.showSurveyManagementPanel(interaction, 0, 'templates');
     if (customId === 'cfg:channels') return panels.showChannelsPanel(interaction);
     if (customId === 'cfg:logchannel:clear') return panels.clearResponsesLogChannel(interaction);
     if (customId === 'cfg:channel:clear') return panels.clearResponseChannel(interaction);
@@ -86,8 +88,8 @@ async function handle(interaction) {
     if (customId.startsWith('cfg:survey:list:')) {
       const parts = customId.split(':');
       const page = parseInt(parts[3], 10) || 0;
-      const archived = parts[4] === '1';
-      return panels.showSurveyManagementPanel(interaction, page, archived);
+      const mode = parts[4] === '1' ? 'archived' : parts[4] === '2' ? 'templates' : 'active';
+      return panels.showSurveyManagementPanel(interaction, page, mode);
     }
     if (customId.startsWith('cfg:logs:')) {
       const page = parseInt(customId.split(':')[2], 10) || 0;
@@ -138,11 +140,7 @@ async function handle(interaction) {
       return panels.backToUserPermissions(interaction, userId);
     }
 
-    // Anonymat (création et édition)
-    if (customId.startsWith('survey:anonmode:')) {
-      const [, , surveyId, mode] = customId.split(':');
-      return panels.handleAnonymityModeChoice(interaction, surveyId, mode);
-    }
+    // Anonymat (édition — ouvre le <select> multi-choix)
     if (customId.startsWith('survey:anonedit:')) {
       const surveyId = customId.split(':')[2];
       return panels.showAnonymityChooserButton(interaction, surveyId);
@@ -177,6 +175,18 @@ async function handle(interaction) {
       const [, , surveyId, questionId] = customId.split(':');
       return panels.confirmDeleteQuestion(interaction, surveyId, questionId);
     }
+    if (customId.startsWith('survey:qmanage:')) {
+      const [, , surveyId, questionId] = customId.split(':');
+      return panels.showQuestionManagePanel(interaction, surveyId, questionId);
+    }
+    if (customId.startsWith('survey:condq:clear:')) {
+      const [, , , surveyId, questionId] = customId.split(':');
+      return panels.clearCondition(interaction, surveyId, questionId);
+    }
+    if (customId.startsWith('survey:condq:')) {
+      const [, , surveyId, questionId] = customId.split(':');
+      return panels.showConditionPicker(interaction, surveyId, questionId);
+    }
     if (customId.startsWith('survey:moveq:')) {
       const [, , surveyId, questionId, direction] = customId.split(':');
       return panels.moveQuestion(interaction, surveyId, questionId, direction);
@@ -204,6 +214,34 @@ async function handle(interaction) {
     if (customId.startsWith('survey:duplicate:')) {
       const surveyId = customId.split(':')[2];
       return panels.duplicateSurvey(interaction, surveyId);
+    }
+    if (customId.startsWith('survey:advanced:')) {
+      const surveyId = customId.split(':')[2];
+      return panels.showDashboardAdvanced(interaction, surveyId);
+    }
+    if (customId.startsWith('survey:exportcsv:')) {
+      const surveyId = customId.split(':')[2];
+      return panels.exportSurveyCsv(interaction, surveyId);
+    }
+    if (customId.startsWith('survey:exportbackup:')) {
+      const surveyId = customId.split(':')[2];
+      return panels.exportSurveyBackup(interaction, surveyId);
+    }
+    if (customId.startsWith('survey:rewardrole:clear:')) {
+      const surveyId = customId.split(':')[3];
+      return panels.clearRewardRole(interaction, surveyId);
+    }
+    if (customId.startsWith('survey:reminder:') && !customId.startsWith('survey:reminder:modal:')) {
+      const surveyId = customId.split(':')[2];
+      return panels.showReminderModal(interaction, surveyId);
+    }
+    if (customId.startsWith('survey:raffle:')) {
+      const surveyId = customId.split(':')[2];
+      return panels.drawRaffleWinner(interaction, surveyId);
+    }
+    if (customId.startsWith('survey:template:toggle:')) {
+      const surveyId = customId.split(':')[3];
+      return panels.toggleTemplate(interaction, surveyId);
     }
     if (customId.startsWith('survey:archive:')) {
       const surveyId = customId.split(':')[2];
@@ -260,9 +298,9 @@ async function handle(interaction) {
       const surveyId = customId.split(':')[2];
       const db = require('./database');
       const survey = db.prepare("SELECT * FROM surveys WHERE id = ? AND status = 'active'").get(surveyId);
-      if (!survey) return interaction.reply({ content: "❌ Cette enquête n'est plus active.", ephemeral: true });
+      if (!survey) return interaction.reply({ content: "❌ Cette enquête n'est plus active.", flags: MessageFlags.Ephemeral });
       if (flow.alreadyMaxedOut(survey, interaction.user.id)) {
-        return interaction.reply({ content: '❌ Tu as déjà répondu au maximum autorisé pour cette enquête.', ephemeral: true });
+        return interaction.reply({ content: '❌ Tu as déjà répondu au maximum autorisé pour cette enquête.', flags: MessageFlags.Ephemeral });
       }
       return flow.startResponseFlow(interaction, survey);
     }
@@ -301,7 +339,7 @@ async function handle(interaction) {
     }
     if (customId === 'mode:admin') {
       if (!perms.hasAnyPerm(interaction)) {
-        return interaction.reply({ content: "❌ Tu n'as pas accès au mode gestion.", ephemeral: true }).catch(() => {});
+        return interaction.reply({ content: "❌ Tu n'as pas accès au mode gestion.", flags: MessageFlags.Ephemeral }).catch(() => {});
       }
       const { embed, components } = panels.buildMainPanel(interaction);
       return interaction.update({ content: null, embeds: [embed], components });
@@ -343,6 +381,10 @@ async function handle(interaction) {
     if (customId === 'cfg:logchannel:select') return panels.setResponsesLogChannel(interaction);
   }
   if (interaction.isRoleSelectMenu()) {
+    if (customId.startsWith('survey:rewardrole:')) {
+      const surveyId = customId.split(':')[2];
+      return panels.setRewardRole(interaction, surveyId);
+    }
     if (customId === 'cfg:broadcast:role') return panels.selectBroadcastRole(interaction);
     if (customId.startsWith('cfg:perm:mprestrict:addrole:')) {
       const userId = customId.split(':')[4];
@@ -370,6 +412,18 @@ async function handle(interaction) {
     }
     if (customId === 'cfg:broadcast:highlight') return panels.handleHighlightSelect(interaction);
     if (customId === 'mode:user:survey') return panels.selectUserSurvey(interaction);
+    if (customId.startsWith('survey:anonmode:')) {
+      const surveyId = customId.split(':')[2];
+      return panels.handleAnonymityModeChoice(interaction, surveyId);
+    }
+    if (customId.startsWith('survey:condq:pick:')) {
+      const [, , , surveyId, questionId] = customId.split(':');
+      return panels.pickConditionSourceQuestion(interaction, surveyId, questionId);
+    }
+    if (customId.startsWith('survey:condq:value:')) {
+      const [, , , surveyId, questionId, sourceId] = customId.split(':');
+      return panels.setConditionValue(interaction, surveyId, questionId, sourceId);
+    }
     if (customId.startsWith('survey:manageq:')) {
       const surveyId = customId.split(':')[2];
       return panels.manageQuestionSelect(interaction, surveyId);
@@ -385,9 +439,9 @@ async function handle(interaction) {
       const survey = db
         .prepare("SELECT * FROM surveys WHERE id = ? AND guild_id = ? AND status = 'active'")
         .get(surveyId, guildId);
-      if (!survey) return interaction.reply({ content: "❌ Cette enquête n'est plus active.", ephemeral: true });
+      if (!survey) return interaction.reply({ content: "❌ Cette enquête n'est plus active.", flags: MessageFlags.Ephemeral });
       if (flow.alreadyMaxedOut(survey, interaction.user.id)) {
-        return interaction.reply({ content: '❌ Tu as déjà répondu au maximum autorisé pour cette enquête.', ephemeral: true });
+        return interaction.reply({ content: '❌ Tu as déjà répondu au maximum autorisé pour cette enquête.', flags: MessageFlags.Ephemeral });
       }
       return flow.startResponseFlow(interaction, survey);
     }
@@ -395,6 +449,10 @@ async function handle(interaction) {
 
   /* ------------------------- MODALS ---------------------------- */
   if (interaction.isModalSubmit()) {
+    if (customId.startsWith('survey:reminder:modal:')) {
+      const surveyId = customId.split(':')[3];
+      return panels.saveReminder(interaction, surveyId);
+    }
     if (customId === 'cfg:dmjoin:modal') return panels.saveDmJoinMessage(interaction);
     if (customId === 'cfg:broadcast:modal') return panels.prepareBroadcast(interaction);
     if (customId.startsWith('cfg:new_survey:modal:')) {

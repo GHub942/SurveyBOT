@@ -1,4 +1,4 @@
-const { SlashCommandBuilder } = require('discord.js');
+const { SlashCommandBuilder, MessageFlags } = require('discord.js');
 const db = require('../database');
 const { startResponseFlow, alreadyMaxedOut } = require('../responseFlow');
 
@@ -32,14 +32,14 @@ module.exports = {
     if (!survey) {
       return interaction.reply({
         content: "❌ Cette enquête n'existe pas ou n'est plus active sur ce serveur.",
-        ephemeral: true
+        flags: MessageFlags.Ephemeral
       });
     }
 
     if (alreadyMaxedOut(survey, interaction.user.id)) {
       return interaction.reply({
         content: `❌ Tu as déjà atteint le nombre maximum de réponses autorisées pour **${survey.name}** (${survey.max_responses_per_user}).`,
-        ephemeral: true
+        flags: MessageFlags.Ephemeral
       });
     }
 

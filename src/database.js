@@ -2,10 +2,15 @@
 // native requise (contrairement à better-sqlite3), donc pas besoin de Visual
 // Studio / build tools sous Windows.
 const { DatabaseSync } = require('node:sqlite');
+const fs = require('fs');
 const path = require('path');
 
-const db = new DatabaseSync(path.join(__dirname, '..', 'data.sqlite'));
+const dbDir = path.join(__dirname, '..', 'databases');
+if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
+
+const db = new DatabaseSync(path.join(dbDir, 'data.sqlite'));
 db.exec('PRAGMA journal_mode = WAL');
+db.exec('PRAGMA synchronous = NORMAL'); // sûr avec WAL, écritures plus rapides
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS guild_config (
@@ -158,6 +163,64 @@ db.exec(`
   UPDATE surveys SET anonymity_mode = 'semi' WHERE anonymity_mode = 'non';
   UPDATE surveys SET anonymity_mode = 'choice' WHERE anonymity_mode = 'choix';
   UPDATE surveys SET anonymity_mode = 'private' WHERE anonymity_mode = 'oui';
+`);
+
+/* ------------------------------------------------------------------ */
+/*  Confidentialité : anonymity_mode (une seule valeur figée) devient  */
+/*  anonymity_modes (liste JSON de 1 à 3 modes parmi public/semi/      */
+/*  private). 1 seul mode => comportement figé identique à avant.      */
+/*  Plusieurs => le membre choisit parmi exactement ceux-là en         */
+/*  répondant (le "choice" historique, limité à public+semi, devient   */
+/*  une combinaison libre, "private" inclus).                          */
+/* ------------------------------------------------------------------ */
+safeAlter('ALTER TABLE surveys ADD COLUMN anonymity_modes TEXT');
+{
+  const rows = db.prepare('SELECT id, anonymity_mode, anonymity_modes FROM surveys WHERE anonymity_modes IS NULL').all();
+  const toJson = m => (m === 'choice' ? JSON.stringify(['public', 'semi']) : JSON.stringify([m || 'semi']));
+  const upd = db.prepare('UPDATE surveys SET anonymity_modes = ? WHERE id = ?');
+  for (const r of rows) upd.run(toJson(r.anonymity_mode), r.id);
+}
+
+// Rappels automatiques : MP envoyé aux membres n'ayant pas encore répondu,
+// X minutes avant la clôture programmée (close_at). reminder_sent_at évite
+// les doublons et se réinitialise si la clôture est reprogrammée.
+safeAlter('ALTER TABLE surveys ADD COLUMN reminder_minutes_before INTEGER');
+safeAlter('ALTER TABLE surveys ADD COLUMN reminder_sent_at INTEGER');
+
+// Questions conditionnelles (logique de saut) : la question n'est affichée
+// que si la réponse à condition_question_id vaut condition_value.
+safeAlter('ALTER TABLE questions ADD COLUMN condition_question_id INTEGER');
+safeAlter('ALTER TABLE questions ADD COLUMN condition_value TEXT');
+
+// Rôle automatique : attribué au membre dès l'envoi de sa réponse, retiré si
+// sa réponse est supprimée (par lui-même ou un admin).
+safeAlter('ALTER TABLE surveys ADD COLUMN reward_role_id TEXT');
+
+// Enquêtes modèles : jamais publiables telles quelles, servent de base à
+// dupliquer pour créer de vraies enquêtes (ex : sondage mensuel récurrent).
+safeAlter('ALTER TABLE surveys ADD COLUMN is_template INTEGER DEFAULT 0');
+
+db.exec(`
+-- Historique des tirages au sort, pour pouvoir exclure les gagnants précédents
+-- d'un nouveau tirage sur la même enquête.
+CREATE TABLE IF NOT EXISTS raffle_winners (
+  survey_id INTEGER NOT NULL,
+  user_id TEXT NOT NULL,
+  drawn_at INTEGER NOT NULL
+);
+`);
+
+// --- Index pour garder de bonnes perfs quand la base grossit ---
+db.exec(`
+CREATE INDEX IF NOT EXISTS idx_responses_survey ON responses(survey_id);
+CREATE INDEX IF NOT EXISTS idx_responses_survey_user ON responses(survey_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_answers_response ON answers(response_id);
+CREATE INDEX IF NOT EXISTS idx_answers_question ON answers(question_id);
+CREATE INDEX IF NOT EXISTS idx_questions_survey ON questions(survey_id);
+CREATE INDEX IF NOT EXISTS idx_surveys_guild ON surveys(guild_id);
+CREATE INDEX IF NOT EXISTS idx_audit_log_guild_created ON audit_log(guild_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_permissions_guild_user ON permissions(guild_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_raffle_winners_survey ON raffle_winners(survey_id);
 `);
 
 module.exports = db;

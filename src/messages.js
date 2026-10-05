@@ -1,7 +1,23 @@
-const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionFlagsBits } = require('discord.js');
 const db = require('./database');
 const logger = require('./logger');
-const { ANONYMITY_LABELS_SHORT: ANONYMITY_LABELS } = require('./utils');
+const { ANONYMITY_LABELS_SHORT: ANONYMITY_LABELS, getAnonymityModes, describeAnonymityModes } = require('./utils');
+
+// Vérifie en amont que le bot a bien les permissions nécessaires pour publier
+// dans un salon, plutôt que de découvrir l'échec via une DiscordAPIError.
+// Retourne un tableau de libellés manquants (vide = tout est bon).
+function missingSendPermissions(channel, guild) {
+  const me = guild.members.me;
+  if (!me) return ['Permissions inconnues (relance le bot)'];
+  const perms = channel.permissionsFor(me);
+  if (!perms) return ['Accès au salon'];
+  const required = [
+    [PermissionFlagsBits.ViewChannel, 'Voir le salon'],
+    [PermissionFlagsBits.SendMessages, 'Envoyer des messages'],
+    [PermissionFlagsBits.EmbedLinks, 'Intégrer des liens']
+  ];
+  return required.filter(([bit]) => !perms.has(bit)).map(([, label]) => label);
+}
 
 // Construit l'embed + bouton du message public d'une enquête (utilisé à la
 // publication et lors des rafraîchissements de statistiques en direct).
@@ -16,7 +32,7 @@ function buildSurveyAnnouncementPayload(survey) {
     .addFields(
       { name: 'Statut', value: survey.status === 'active' ? '🟢 Active' : '🔴 Fermée', inline: true },
       { name: 'Réponses max/util.', value: survey.max_responses_per_user === 0 ? 'Illimité' : String(survey.max_responses_per_user), inline: true },
-      { name: 'Anonymat', value: ANONYMITY_LABELS[survey.anonymity_mode] || survey.anonymity_mode, inline: true },
+      { name: 'Confidentialité', value: describeAnonymityModes(getAnonymityModes(survey)), inline: true },
       { name: 'Clôture', value: survey.close_at ? `<t:${Math.floor(survey.close_at / 1000)}:f>` : 'Aucune', inline: true },
       { name: 'Questions', value: String(questionCount), inline: true },
       { name: 'Réponses reçues', value: String(responseCount), inline: true }
@@ -75,4 +91,4 @@ async function logResponseToChannel(client, survey, session) {
   }
 }
 
-module.exports = { buildSurveyAnnouncementPayload, updatePublicMessageStats, logResponseToChannel, ANONYMITY_LABELS };
+module.exports = { buildSurveyAnnouncementPayload, updatePublicMessageStats, logResponseToChannel, missingSendPermissions, ANONYMITY_LABELS };

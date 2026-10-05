@@ -6,12 +6,14 @@ const {
   StringSelectMenuBuilder,
   ModalBuilder,
   TextInputBuilder,
-  TextInputStyle
+  TextInputStyle,
+  MessageFlags
 } = require('discord.js');
 const db = require('./database');
 const messages = require('./messages');
 const logs = require('./logs');
 const logger = require('./logger');
+const { getAnonymityModes } = require('./utils');
 
 /* ------------------------------------------------------------------ */
 /*  Sessions de réponse — persistées en base (survivent à un redémarrage)*/
@@ -92,19 +94,32 @@ function renderClosedNotice() {
 // Mode "choice" : le membre choisit entre Publique (nom visible dans les stats)
 // et Semi-privé (nom visible du staff uniquement). Le mode Privé n'a pas cette
 // étape : il est toujours entièrement anonyme, défini directement à la création.
+const PRIVACY_CHOICE_DESC = {
+  public: '🌐 **Publique** — ton nom sera visible dans les statistiques',
+  semi: '🛡️ **Semi-privé** — ton nom ne sera visible que du staff',
+  private: '🙈 **Privé** — aucun nom conservé, réponse totalement anonyme'
+};
+const PRIVACY_CHOICE_BUTTON = {
+  public: { label: 'Publique', emoji: '🌐' },
+  semi: { label: 'Semi-privé', emoji: '🛡️' },
+  private: { label: 'Privé', emoji: '🙈' }
+};
+
 function renderPrivacyChoiceStep(session) {
+  const modes = getAnonymityModes(session.survey);
   const embed = new EmbedBuilder()
     .setColor(0x5865f2)
     .setTitle(`📝 ${session.survey.name}`)
-    .setDescription(
-      `${previewBanner(session)}Comment veux-tu répondre ?\n\n` +
-        '🌐 **Publique** — ton nom sera visible dans les statistiques\n' +
-        '🛡️ **Semi-privé** — ton nom ne sera visible que du staff'
-    );
+    .setDescription(`${previewBanner(session)}Comment veux-tu répondre ?\n\n${modes.map(m => PRIVACY_CHOICE_DESC[m]).join('\n')}`);
 
   const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`resp:priv:${session.survey.id}:public`).setLabel('Publique').setStyle(ButtonStyle.Primary).setEmoji('🌐'),
-    new ButtonBuilder().setCustomId(`resp:priv:${session.survey.id}:semi`).setLabel('Semi-privé').setStyle(ButtonStyle.Secondary).setEmoji('🛡️')
+    modes.map((m, i) =>
+      new ButtonBuilder()
+        .setCustomId(`resp:priv:${session.survey.id}:${m}`)
+        .setLabel(PRIVACY_CHOICE_BUTTON[m].label)
+        .setEmoji(PRIVACY_CHOICE_BUTTON[m].emoji)
+        .setStyle(i === 0 ? ButtonStyle.Primary : ButtonStyle.Secondary)
+    )
   );
 
   return { embeds: [embed], components: [row] };
@@ -178,11 +193,14 @@ function renderQuestion(session) {
 }
 
 function renderRecap(session) {
-  const lines = session.questions.map((q, i) => {
-    const val = session.answers[i];
-    const displayed = val === null || val === undefined || val === '' ? '*(pas de réponse)*' : String(val).slice(0, 200);
-    return `**${i + 1}. ${q.label}**\n${displayed}`;
-  });
+  const lines = session.questions
+    .map((q, i) => {
+      if (!isQuestionApplicable(session, i)) return null; // question masquée par une condition non remplie
+      const val = session.answers[i];
+      const displayed = val === null || val === undefined || val === '' ? '*(pas de réponse)*' : String(val).slice(0, 200);
+      return `**${i + 1}. ${q.label}**\n${displayed}`;
+    })
+    .filter(Boolean);
 
   const privacyTag = session.anonymous ? '🙈 Envoi privé (anonyme)' : session.isPublic ? '🌐 Envoi public' : session.isPublic === false ? '🛡️ Envoi semi-privé' : 'Vérifie tes réponses avant envoi';
 
@@ -229,9 +247,41 @@ function renderDone(preview, editMode = false) {
   };
 }
 
+/* ------------------- Questions conditionnelles (logique de saut) ------------------- */
+
+// Une question sans condition est toujours applicable. Sinon, elle ne
+// s'affiche que si la réponse à la question source correspond exactement
+// (ou, pour un choix multiple, fait partie des valeurs cochées).
+function isQuestionApplicable(session, index) {
+  const q = session.questions[index];
+  if (!q.condition_question_id) return true;
+  const srcIndex = session.questions.findIndex(sq => sq.id === q.condition_question_id);
+  if (srcIndex === -1) return true; // question source introuvable (supprimée) -> on affiche par défaut
+  const srcAnswer = session.answers[srcIndex];
+  if (srcAnswer === null || srcAnswer === undefined || srcAnswer === '') return false;
+  return String(srcAnswer).split(', ').includes(q.condition_value);
+}
+
+// Avance au prochain index applicable, en effaçant au passage toute réponse
+// orpheline sur les questions désormais masquées (condition changée en arrière).
+function advanceToNextApplicable(session) {
+  let i = session.index + 1;
+  while (i < session.questions.length && !isQuestionApplicable(session, i)) {
+    session.answers[i] = null;
+    i++;
+  }
+  session.index = i;
+}
+
+function retreatToPrevApplicable(session) {
+  let i = session.index - 1;
+  while (i > 0 && !isQuestionApplicable(session, i)) i--;
+  session.index = Math.max(0, i);
+}
+
 function renderCurrentStep(session) {
   if (!session.preview && session.survey.status !== 'active') return renderClosedNotice();
-  if (session.survey.anonymity_mode === 'choice' && session.anonymous === null && session.isPublic === null) return renderPrivacyChoiceStep(session);
+  if (getAnonymityModes(session.survey).length > 1 && session.anonymous === null && session.isPublic === null) return renderPrivacyChoiceStep(session);
   if (session.index >= session.questions.length) return renderRecap(session);
   return renderQuestion(session);
 }
@@ -243,7 +293,7 @@ function renderCurrentStep(session) {
 async function startResponseFlow(interaction, survey, preview = false, editMode = false) {
   const questions = db.prepare('SELECT * FROM questions WHERE survey_id = ? ORDER BY position ASC').all(survey.id);
   if (!questions.length) {
-    return interaction.reply({ content: "❌ Cette enquête n'a pas encore de questions.", ephemeral: true });
+    return interaction.reply({ content: "❌ Cette enquête n'a pas encore de questions.", flags: MessageFlags.Ephemeral });
   }
 
   const userId = interaction.user.id;
@@ -272,16 +322,19 @@ async function startResponseFlow(interaction, survey, preview = false, editMode 
     }
 
     if (anonymous === null && isPublic === null) {
-      if (survey.anonymity_mode === 'private') anonymous = true;
-      else if (survey.anonymity_mode === 'public') {
-        anonymous = false;
-        isPublic = true;
-      } else if (survey.anonymity_mode === 'semi') {
-        anonymous = false;
-        isPublic = false;
+      const modes = getAnonymityModes(survey);
+      if (modes.length === 1) {
+        if (modes[0] === 'private') anonymous = true;
+        else if (modes[0] === 'public') {
+          anonymous = false;
+          isPublic = true;
+        } else if (modes[0] === 'semi') {
+          anonymous = false;
+          isPublic = false;
+        }
       }
-      // mode 'choice' : anonymous/isPublic restent null jusqu'au choix du membre
-      // (sauf en édition, où le choix d'origine a déjà été repris ci-dessus).
+      // Plusieurs modes activés : anonymous/isPublic restent null jusqu'au
+      // choix du membre (sauf en édition, déjà fixé ci-dessus).
     }
 
     session = { survey, questions, userId, index: 0, answers: initialAnswers, anonymous, isPublic, preview, editMode: !!editMode };
@@ -304,7 +357,7 @@ async function startResponseFlow(interaction, survey, preview = false, editMode 
 
   const rendered = renderCurrentStep(session);
   const content = preview ? "🔍 **Ceci est un aperçu.** Tes réponses ne seront pas enregistrées." : editMode ? '✏️ **Modification de ta réponse** — les champs déjà remplis reprennent ta réponse actuelle.' : undefined;
-  await interaction.reply({ content, ...rendered, ephemeral: true });
+  await interaction.reply({ content, ...rendered, flags: MessageFlags.Ephemeral });
 }
 
 /* ------------------------------------------------------------------ */
@@ -313,10 +366,15 @@ async function startResponseFlow(interaction, survey, preview = false, editMode 
 
 async function handleAnonymityChoice(interaction, surveyId, value) {
   const session = loadSession(surveyId, interaction.user.id);
-  if (!session) return interaction.reply({ content: '❌ Session expirée, relance `/enquete`.', ephemeral: true });
+  if (!session) return interaction.reply({ content: '❌ Session expirée, relance `/enquete`.', flags: MessageFlags.Ephemeral });
 
-  session.anonymous = false;
-  session.isPublic = value === 'public';
+  if (value === 'private') {
+    session.anonymous = true;
+    session.isPublic = null;
+  } else {
+    session.anonymous = false;
+    session.isPublic = value === 'public';
+  }
   saveSession(session);
 
   await interaction.update(renderCurrentStep(session));
@@ -328,9 +386,9 @@ async function handleAnonymityChoice(interaction, surveyId, value) {
 
 async function handlePrevious(interaction, surveyId) {
   const session = loadSession(surveyId, interaction.user.id);
-  if (!session) return interaction.reply({ content: '❌ Session expirée, relance `/enquete`.', ephemeral: true });
+  if (!session) return interaction.reply({ content: '❌ Session expirée, relance `/enquete`.', flags: MessageFlags.Ephemeral });
 
-  session.index = Math.max(0, session.index - 1);
+  retreatToPrevApplicable(session);
   saveSession(session);
   await interaction.update(renderCurrentStep(session));
 }
@@ -351,7 +409,7 @@ async function handleCancel(interaction, surveyId) {
 
 async function handleConfirm(interaction, surveyId) {
   const session = loadSession(surveyId, interaction.user.id);
-  if (!session) return interaction.reply({ content: '❌ Session expirée, relance `/enquete`.', ephemeral: true });
+  if (!session) return interaction.reply({ content: '❌ Session expirée, relance `/enquete`.', flags: MessageFlags.Ephemeral });
 
   if (session.preview) {
     clearSession(surveyId, interaction.user.id);
@@ -405,6 +463,15 @@ async function handleConfirm(interaction, surveyId) {
   try {
     await messages.updatePublicMessageStats(interaction.client, session.survey);
     if (!session.editMode) await messages.logResponseToChannel(interaction.client, session.survey, session);
+    // Rôle de récompense : attribué quel que soit le mode de confidentialité
+    // choisi pour la réponse (le bot sait toujours qui a cliqué, seule la
+    // donnée enregistrée est anonyme) — idempotent si déjà présent.
+    if (session.survey.reward_role_id) {
+      const member = await interaction.guild?.members.fetch(session.userId).catch(() => null);
+      if (member && !member.roles.cache.has(session.survey.reward_role_id)) {
+        await member.roles.add(session.survey.reward_role_id).catch(err => logger.warn("Impossible d'attribuer le rôle de récompense :", err));
+      }
+    }
   } catch (err) {
     logger.warn("Erreur lors des effets de bord après l'envoi d'une réponse:", err);
   }
@@ -416,7 +483,7 @@ async function handleConfirm(interaction, surveyId) {
 
 async function showAnswerModal(interaction, surveyId) {
   const session = loadSession(surveyId, interaction.user.id);
-  if (!session) return interaction.reply({ content: '❌ Session expirée, relance `/enquete`.', ephemeral: true });
+  if (!session) return interaction.reply({ content: '❌ Session expirée, relance `/enquete`.', flags: MessageFlags.Ephemeral });
   if (!session.preview && session.survey.status !== 'active') return interaction.update(renderClosedNotice());
 
   const q = session.questions[session.index];
@@ -438,11 +505,11 @@ async function showAnswerModal(interaction, surveyId) {
 
 async function handleSelectAnswer(interaction, surveyId) {
   const session = loadSession(surveyId, interaction.user.id);
-  if (!session) return interaction.reply({ content: '❌ Session expirée, relance `/enquete`.', ephemeral: true });
+  if (!session) return interaction.reply({ content: '❌ Session expirée, relance `/enquete`.', flags: MessageFlags.Ephemeral });
   if (!session.preview && session.survey.status !== 'active') return interaction.update(renderClosedNotice());
 
   session.answers[session.index] = interaction.values.join(', ');
-  session.index++;
+  advanceToNextApplicable(session);
   saveSession(session);
 
   await interaction.update(renderCurrentStep(session));
@@ -450,11 +517,11 @@ async function handleSelectAnswer(interaction, surveyId) {
 
 async function handleSkip(interaction, surveyId) {
   const session = loadSession(surveyId, interaction.user.id);
-  if (!session) return interaction.reply({ content: '❌ Session expirée, relance `/enquete`.', ephemeral: true });
+  if (!session) return interaction.reply({ content: '❌ Session expirée, relance `/enquete`.', flags: MessageFlags.Ephemeral });
   if (!session.preview && session.survey.status !== 'active') return interaction.update(renderClosedNotice());
 
   session.answers[session.index] = null;
-  session.index++;
+  advanceToNextApplicable(session);
   saveSession(session);
 
   await interaction.update(renderCurrentStep(session));
@@ -462,7 +529,7 @@ async function handleSkip(interaction, surveyId) {
 
 async function handleModalAnswer(interaction, surveyId) {
   const session = loadSession(surveyId, interaction.user.id);
-  if (!session) return interaction.reply({ content: '❌ Session expirée, relance `/enquete`.', ephemeral: true });
+  if (!session) return interaction.reply({ content: '❌ Session expirée, relance `/enquete`.', flags: MessageFlags.Ephemeral });
 
   const q = session.questions[session.index];
   const value = interaction.fields.getTextInputValue('answer').trim();
@@ -470,18 +537,18 @@ async function handleModalAnswer(interaction, surveyId) {
   if (q.type === 'nombre' && value !== '') {
     const num = Number(value);
     if (Number.isNaN(num)) {
-      return interaction.reply({ content: '❌ Merci d\'entrer un nombre valide. Recommence en cliquant sur "Répondre".', ephemeral: true });
+      return interaction.reply({ content: '❌ Merci d\'entrer un nombre valide. Recommence en cliquant sur "Répondre".', flags: MessageFlags.Ephemeral });
     }
     if (q.min_value !== null && q.min_value !== undefined && num < q.min_value) {
-      return interaction.reply({ content: `❌ La valeur doit être supérieure ou égale à ${q.min_value}. Recommence en cliquant sur "Répondre".`, ephemeral: true });
+      return interaction.reply({ content: `❌ La valeur doit être supérieure ou égale à ${q.min_value}. Recommence en cliquant sur "Répondre".`, flags: MessageFlags.Ephemeral });
     }
     if (q.max_value !== null && q.max_value !== undefined && num > q.max_value) {
-      return interaction.reply({ content: `❌ La valeur doit être inférieure ou égale à ${q.max_value}. Recommence en cliquant sur "Répondre".`, ephemeral: true });
+      return interaction.reply({ content: `❌ La valeur doit être inférieure ou égale à ${q.max_value}. Recommence en cliquant sur "Répondre".`, flags: MessageFlags.Ephemeral });
     }
   }
 
   session.answers[session.index] = value || null;
-  session.index++;
+  advanceToNextApplicable(session);
   saveSession(session);
 
   const payload = renderCurrentStep(session);
@@ -490,7 +557,7 @@ async function handleModalAnswer(interaction, surveyId) {
   if (interaction.isFromMessage && interaction.isFromMessage()) {
     await interaction.update(payload);
   } else {
-    await interaction.reply({ ...payload, ephemeral: true });
+    await interaction.reply({ ...payload, flags: MessageFlags.Ephemeral });
   }
 }
 

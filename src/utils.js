@@ -32,17 +32,36 @@ const DM_PRESETS = [
 const ANONYMITY_LABELS = {
   public: '🌐 Publique (nom visible dans les stats)',
   semi: '🛡️ Semi-privé (nom visible du staff uniquement)',
-  private: '🙈 Privé (anonyme, réponses illimitées)',
-  choice: '🎭 Au choix (Publique ou Semi-privé)'
+  private: '🙈 Privé (anonyme, réponses illimitées)'
 };
 
 // Libellés courts, utilisés là où l'espace est limité (embeds, footers)
 const ANONYMITY_LABELS_SHORT = {
   public: '🌐 Publique',
   semi: '🛡️ Semi-privé',
-  private: '🙈 Privé',
-  choice: '🎭 Au choix'
+  private: '🙈 Privé'
 };
+
+// Lit la liste de modes de confidentialité activés pour une enquête
+// (colonne JSON `anonymity_modes`), avec repli sûr si absente/invalide/vide.
+function getAnonymityModes(survey) {
+  try {
+    const parsed = JSON.parse(survey.anonymity_modes || 'null');
+    if (Array.isArray(parsed) && parsed.length) {
+      const valid = parsed.filter(m => ANONYMITY_LABELS_SHORT[m]);
+      if (valid.length) return valid;
+    }
+  } catch {
+    /* ignore JSON invalide, on retombe sur le repli ci-dessous */
+  }
+  return [ANONYMITY_LABELS_SHORT[survey.anonymity_mode] ? survey.anonymity_mode : 'semi'];
+}
+
+// Libellé combiné court : un seul mode -> son libellé ; plusieurs -> "Au choix : A, B".
+function describeAnonymityModes(modes) {
+  if (modes.length === 1) return ANONYMITY_LABELS_SHORT[modes[0]];
+  return `🎭 Au choix : ${modes.map(m => ANONYMITY_LABELS_SHORT[m].replace(/^\S+\s/, '')).join(', ')}`;
+}
 
 // Brouillons de MP en attente de confirmation : clé = userId
 // valeur = { target, message, recipientsPreview }
@@ -171,6 +190,8 @@ module.exports = {
   DM_PRESETS,
   ANONYMITY_LABELS,
   ANONYMITY_LABELS_SHORT,
+  getAnonymityModes,
+  describeAnonymityModes,
   SURVEY_TEMPLATES,
   toCsvValue,
   chunk,

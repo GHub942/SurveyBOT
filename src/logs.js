@@ -89,7 +89,10 @@ const ACTION_LABELS = {
   'survey.selfdelete.toggle': '🔧 Option de suppression en libre-service modifiée',
   'survey.selfedit.toggle': '🔧 Option de modification en libre-service modifiée',
   'survey.archive': '🗄️ Enquête archivée',
-  'survey.unarchive': '📤 Enquête désarchivée'
+  'survey.unarchive': '📤 Enquête désarchivée',
+  'survey.raffle': '🎲 Tirage au sort effectué',
+  'survey.restore': '📥 Enquête restaurée depuis une sauvegarde',
+  'reminder.sent': '⏰ Rappel automatique envoyé'
 };
 
 module.exports = { log, logFromInteraction, getRecentLogs, countLogs, getDistinctActions, ACTION_LABELS };

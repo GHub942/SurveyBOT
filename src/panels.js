@@ -11,13 +11,15 @@ const {
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
-  AttachmentBuilder
+  AttachmentBuilder,
+  MessageFlags
 } = require('discord.js');
 const db = require('./database');
 const logs = require('./logs');
 const perms = require('./permissions');
 const messages = require('./messages');
 const flow = require('./responseFlow');
+const logger = require('./logger');
 const {
   broadcastTargets,
   broadcastDrafts,
@@ -25,7 +27,11 @@ const {
   questionDrafts,
   DM_PRESETS,
   ANONYMITY_LABELS,
+  ANONYMITY_LABELS_SHORT,
+  getAnonymityModes,
+  describeAnonymityModes,
   SURVEY_TEMPLATES,
+  toCsvValue,
   chunk,
   parseDateTimeFR,
   renderBar,
@@ -47,7 +53,7 @@ async function respondPreferUpdate(interaction, payload) {
   if (interaction.isFromMessage && interaction.isFromMessage()) {
     return interaction.update(payload);
   }
-  return interaction.reply({ ...payload, ephemeral: true });
+  return interaction.reply({ ...payload, flags: MessageFlags.Ephemeral });
 }
 
 /* ------------------------------------------------------------------ */
@@ -76,10 +82,10 @@ function buildModeChooserPanel(interaction) {
 function buildMainPanel(interaction) {
   const guildId = interaction.guildId;
   const cfg = db.prepare('SELECT * FROM guild_config WHERE guild_id = ?').get(guildId) || {};
-  const surveyCount = db.prepare("SELECT COUNT(*) c FROM surveys WHERE guild_id = ? AND (archived IS NULL OR archived = 0)").get(guildId).c;
-  const activeCount = db.prepare("SELECT COUNT(*) c FROM surveys WHERE guild_id = ? AND status = 'active' AND (archived IS NULL OR archived = 0)").get(guildId).c;
+  const surveyCount = db.prepare("SELECT COUNT(*) c FROM surveys WHERE guild_id = ? AND (archived IS NULL OR archived = 0) AND is_template = 0").get(guildId).c;
+  const activeCount = db.prepare("SELECT COUNT(*) c FROM surveys WHERE guild_id = ? AND status = 'active' AND (archived IS NULL OR archived = 0) AND is_template = 0").get(guildId).c;
   const totalResponses = db
-    .prepare("SELECT COUNT(*) c FROM responses r JOIN surveys s ON r.survey_id = s.id WHERE s.guild_id = ? AND (s.archived IS NULL OR s.archived = 0)")
+    .prepare("SELECT COUNT(*) c FROM responses r JOIN surveys s ON r.survey_id = s.id WHERE s.guild_id = ? AND (s.archived IS NULL OR s.archived = 0) AND s.is_template = 0")
     .get(guildId).c;
 
   const canSurveys = perms.hasPerm(interaction, perms.PERMS.MANAGE_SURVEYS);
@@ -88,7 +94,8 @@ function buildMainPanel(interaction) {
   const canWelcome = perms.hasPerm(interaction, perms.PERMS.MANAGE_MP_WELCOME);
   const canLogs = perms.hasPerm(interaction, perms.PERMS.VIEW_LOGS);
   const canData = perms.hasPerm(interaction, perms.PERMS.MANAGE_DATA);
-  const isManager = perms.isServerManager(interaction);
+  const canManagePerms = perms.canManagePermissions(interaction);
+  const isManager = perms.isOwner(interaction);
 
   const embed = new EmbedBuilder()
     .setTitle('📊 Tableau de bord — Enquêtes')
@@ -107,7 +114,7 @@ function buildMainPanel(interaction) {
   if (canWelcome) {
     fields.push({ name: '👋 MP de bienvenue', value: cfg.dm_on_join ? '✅ Activé' : '❌ Désactivé', inline: true });
   }
-  if (isManager) {
+  if (isManager || canManagePerms) {
     const permCount = perms.getUsersWithAnyPerm(guildId).length;
     fields.push({ name: '🔑 Permissions déléguées', value: `${permCount} membre(s)`, inline: true });
   }
@@ -133,7 +140,7 @@ function buildMainPanel(interaction) {
   if (canLogs) adminRow.push(new ButtonBuilder().setCustomId('cfg:logs:0').setLabel('Journal').setStyle(ButtonStyle.Secondary).setEmoji('📜'));
   if (canData) adminRow.push(new ButtonBuilder().setCustomId('cfg:data').setLabel('Gérer les données').setStyle(ButtonStyle.Secondary).setEmoji('🗄️'));
   if (canSurveys) adminRow.push(new ButtonBuilder().setCustomId('cfg:stats').setLabel('Statistiques').setStyle(ButtonStyle.Secondary).setEmoji('📊'));
-  if (isManager) adminRow.push(new ButtonBuilder().setCustomId('cfg:perm').setLabel('Permissions').setStyle(ButtonStyle.Secondary).setEmoji('🔑'));
+  if (isManager || canManagePerms) adminRow.push(new ButtonBuilder().setCustomId('cfg:perm').setLabel('Permissions').setStyle(ButtonStyle.Secondary).setEmoji('🔑'));
 
   const modeRow = [new ButtonBuilder().setCustomId('mode:user').setLabel('Mode utilisateur').setStyle(ButtonStyle.Secondary).setEmoji('👤')];
 
@@ -158,7 +165,7 @@ function buildMainPanel(interaction) {
 async function showGlobalStats(interaction, filter = 'all') {
   const guildId = interaction.guildId;
   // Les enquêtes archivées ne comptent plus dans les statistiques globales.
-  const byStatus = db.prepare("SELECT status, COUNT(*) c FROM surveys WHERE guild_id = ? AND (archived IS NULL OR archived = 0) GROUP BY status").all(guildId);
+  const byStatus = db.prepare("SELECT status, COUNT(*) c FROM surveys WHERE guild_id = ? AND (archived IS NULL OR archived = 0) AND is_template = 0 GROUP BY status").all(guildId);
   const statusMap = Object.fromEntries(byStatus.map(r => [r.status, r.c]));
   const totalSurveys = byStatus.reduce((s, r) => s + r.c, 0);
   const archivedCount = db.prepare('SELECT COUNT(*) c FROM surveys WHERE guild_id = ? AND archived = 1').get(guildId).c;
@@ -166,7 +173,7 @@ async function showGlobalStats(interaction, filter = 'all') {
   const filterLabels = { all: 'Toutes', active: '🟢 Actives', draft: '📝 Brouillons', closed: '🔴 Fermées' };
   const statusClause = filter === 'all' ? '' : 'AND s.status = ?';
   const params = filter === 'all' ? [guildId] : [guildId, filter];
-  const archivedClause = "AND (s.archived IS NULL OR s.archived = 0)";
+  const archivedClause = "AND (s.archived IS NULL OR s.archived = 0) AND s.is_template = 0";
 
   const totalResponses = db
     .prepare(`SELECT COUNT(*) c FROM responses r JOIN surveys s ON r.survey_id = s.id WHERE s.guild_id = ? ${archivedClause} ${statusClause}`)
@@ -282,7 +289,8 @@ async function clearResponsesLogChannel(interaction) {
 
 async function showPermissionsPanel(interaction) {
   const guildId = interaction.guildId;
-  const userIds = perms.getUsersWithAnyPerm(guildId);
+  const ownerId = interaction.guild.ownerId;
+  const userIds = perms.getUsersWithAnyPerm(guildId).filter(uid => uid !== ownerId);
 
   const lines = userIds.length
     ? userIds
@@ -291,13 +299,15 @@ async function showPermissionsPanel(interaction) {
           return `<@${uid}> — ${p.map(x => perms.PERM_LABELS[x]).join(', ')}`;
         })
         .join('\n')
-    : "*Aucun utilisateur n'a de permission pour l'instant (en dehors de « Gérer le serveur »).*";
+    : '*Personne d\'autre n\'a de permission pour l\'instant.*';
 
   const embed = new EmbedBuilder()
     .setColor(0x5865f2)
     .setTitle('🔑 Gestion des permissions')
     .setDescription(
-      "Chaque membre peut recevoir une ou plusieurs permissions indépendantes.\nLes membres avec **Gérer le serveur** ont automatiquement accès à tout.\n\n**Permissions actuellement attribuées :**\n" +
+      "Seul le **propriétaire du serveur** a automatiquement accès à tout — aucune permission Discord ne donne plus accès au bot. " +
+        "Tout autre membre doit recevoir ses permissions explicitement ci-dessous.\n\n" +
+        `**👑 <@${ownerId}>** — propriétaire : toutes les permissions (verrouillé)\n\n**Autres membres :**\n` +
         lines
     );
 
@@ -309,23 +319,29 @@ async function showPermissionsPanel(interaction) {
   await interaction.update({ embeds: [embed], components: [select, back] });
 }
 
-function buildUserPermissionsPanel(guildId, userId) {
-  const current = perms.getUserPerms(guildId, userId);
+function buildUserPermissionsPanel(guildId, userId, ownerId = null) {
+  const isOwnerTarget = !!ownerId && userId === ownerId;
+  const current = isOwnerTarget ? perms.ALL_PERMS : perms.getUserPerms(guildId, userId);
   const embed = new EmbedBuilder()
     .setColor(0x5865f2)
     .setTitle(`🔑 Permissions de <@${userId}>`)
-    .setDescription('Clique sur une permission pour l\'activer ou la désactiver.');
+    .setDescription(
+      isOwnerTarget
+        ? '👑 Propriétaire du serveur : toutes les permissions sont accordées en permanence et **ne peuvent pas être modifiées**.'
+        : "Clique sur une permission pour l'activer ou la désactiver."
+    );
 
   const buttons = perms.ALL_PERMS.map(p =>
     new ButtonBuilder()
       .setCustomId(`cfg:perm:toggle:${userId}:${p}`)
       .setLabel(perms.PERM_LABELS[p])
       .setStyle(current.includes(p) ? ButtonStyle.Success : ButtonStyle.Secondary)
+      .setDisabled(isOwnerTarget)
   );
 
   const components = chunk(buttons, 3).map(group => new ActionRowBuilder().addComponents(group));
 
-  if (current.includes(perms.PERMS.MANAGE_MP)) {
+  if (!isOwnerTarget && current.includes(perms.PERMS.MANAGE_MP)) {
     components.push(
       new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`cfg:perm:mprestrict:${userId}`).setLabel('Limiter les cibles MP de ce membre').setStyle(ButtonStyle.Secondary).setEmoji('🎯')
@@ -340,14 +356,19 @@ function buildUserPermissionsPanel(guildId, userId) {
 
 async function selectPermissionUser(interaction) {
   const userId = interaction.values[0];
-  const { embed, components } = buildUserPermissionsPanel(interaction.guildId, userId);
+  const { embed, components } = buildUserPermissionsPanel(interaction.guildId, userId, interaction.guild.ownerId);
   await interaction.update({ embeds: [embed], components });
 }
 
 async function togglePermission(interaction, userId, perm) {
-  const now = perms.togglePerm(interaction.guildId, userId, perm);
+  if (userId === interaction.guild.ownerId) {
+    // Verrouillé : on réaffiche simplement le panneau sans rien changer.
+    const { embed, components } = buildUserPermissionsPanel(interaction.guildId, userId, interaction.guild.ownerId);
+    return interaction.update({ embeds: [embed], components });
+  }
+  const now = perms.togglePerm(interaction.guildId, userId, perm, interaction.guild.ownerId);
   logs.logFromInteraction(interaction, 'permissions.toggle', `<@${userId}> — ${perms.PERM_LABELS[perm]} ${now ? 'accordée' : 'retirée'}`);
-  const { embed, components } = buildUserPermissionsPanel(interaction.guildId, userId);
+  const { embed, components } = buildUserPermissionsPanel(interaction.guildId, userId, interaction.guild.ownerId);
   await interaction.update({ embeds: [embed], components });
 }
 
@@ -398,7 +419,7 @@ async function clearMpRestrictionsHandler(interaction, userId) {
 }
 
 async function backToUserPermissions(interaction, userId) {
-  const { embed, components } = buildUserPermissionsPanel(interaction.guildId, userId);
+  const { embed, components } = buildUserPermissionsPanel(interaction.guildId, userId, interaction.guild.ownerId);
   await interaction.update({ embeds: [embed], components });
 }
 
@@ -526,7 +547,7 @@ function buildBroadcastEmbed(substitutedMessage, highlightSurvey) {
   const embed = new EmbedBuilder().setColor(0x5865f2).setDescription(substitutedMessage.slice(0, 4000));
   if (highlightSurvey) {
     embed.setTitle(`📋 ${highlightSurvey.name}`);
-    embed.setFooter({ text: ANONYMITY_LABELS[highlightSurvey.anonymity_mode] || '' });
+    embed.setFooter({ text: describeAnonymityModes(getAnonymityModes(highlightSurvey)) });
   }
   return embed;
 }
@@ -663,7 +684,7 @@ async function selectBroadcastRole(interaction) {
   const roleId = interaction.values[0];
   const check = perms.validateMpTarget(interaction, 'role', [roleId]);
   if (!check.ok) {
-    return interaction.reply({ content: `❌ Tu n'es pas autorisé à cibler ce rôle. Rôles/membres autorisés configurés par un responsable du serveur.`, ephemeral: true });
+    return interaction.reply({ content: `❌ Tu n'es pas autorisé à cibler ce rôle. Rôles/membres autorisés configurés par un responsable du serveur.`, flags: MessageFlags.Ephemeral });
   }
   const draft = broadcastTargets.get(interaction.user.id) || {};
   broadcastTargets.set(interaction.user.id, { ...draft, type: 'role', roleId });
@@ -676,7 +697,7 @@ async function selectBroadcastUsers(interaction) {
   if (!check.ok) {
     return interaction.reply({
       content: `❌ Tu n'es pas autorisé à cibler ${check.notAllowed.map(id => `<@${id}>`).join(', ')}. Un responsable du serveur peut ajuster tes cibles autorisées.`,
-      ephemeral: true
+      flags: MessageFlags.Ephemeral
     });
   }
   const draft = broadcastTargets.get(interaction.user.id) || {};
@@ -735,7 +756,7 @@ function buildVariableContext(interactionGuild, member, highlightSurvey) {
     userId: member.id,
     surveyName: highlightSurvey?.name,
     surveyId: highlightSurvey?.id,
-    surveyPrivacy: highlightSurvey ? ANONYMITY_LABELS[highlightSurvey.anonymity_mode] || '' : '',
+    surveyPrivacy: highlightSurvey ? describeAnonymityModes(getAnonymityModes(highlightSurvey)) : '',
     serverName: interactionGuild.name
   };
 }
@@ -752,7 +773,7 @@ async function prepareBroadcast(interaction) {
   const highlightSurveyId = target.highlightSurveyId || null;
   const highlightSurvey = highlightSurveyId ? db.prepare('SELECT * FROM surveys WHERE id = ?').get(highlightSurveyId) : null;
 
-  await interaction.reply({ content: '🔎 Calcul du nombre de destinataires…', ephemeral: true });
+  await interaction.reply({ content: '🔎 Calcul du nombre de destinataires…', flags: MessageFlags.Ephemeral });
 
   const recipients = await resolveRecipients(interaction.guild, target);
   broadcastDrafts.set(interaction.user.id, { target, message: rawMessage, highlightSurveyId, recipients });
@@ -792,7 +813,7 @@ async function prepareBroadcast(interaction) {
     content: '👁️ **Aperçu du rendu final** (avec tes propres infos en exemple ; les boutons ci-dessous ne sont pas fonctionnels) :',
     embeds: [previewEmbed],
     components: previewComponents,
-    ephemeral: true
+    flags: MessageFlags.Ephemeral
   });
 }
 
@@ -838,7 +859,7 @@ async function confirmBroadcast(interaction) {
 
   await interaction.followUp({
     content: `✅ Envoi terminé (${targetLabel}) : **${success}** MP envoyés, **${failed}** échecs (MP fermés ou bot).`,
-    ephemeral: true
+    flags: MessageFlags.Ephemeral
   });
 }
 
@@ -847,23 +868,27 @@ async function confirmBroadcast(interaction) {
 /*  GESTION DES ENQUÊTES — menu unique (créer / voir la liste)          */
 /* ------------------------------------------------------------------ */
 
-async function showSurveyManagementPanel(interaction, page = 0, archived = false) {
-  const all = db.prepare('SELECT * FROM surveys WHERE guild_id = ? AND archived = ? ORDER BY created_at DESC').all(interaction.guildId, archived ? 1 : 0);
-  const archivedCount = archived ? all.length : db.prepare('SELECT COUNT(*) c FROM surveys WHERE guild_id = ? AND archived = 1').get(interaction.guildId).c;
+async function showSurveyManagementPanel(interaction, page = 0, mode = 'active') {
+  const guildId = interaction.guildId;
+  const where = mode === 'archived' ? 'archived = 1' : mode === 'templates' ? 'is_template = 1' : 'archived = 0 AND is_template = 0';
+  const all = db.prepare(`SELECT * FROM surveys WHERE guild_id = ? AND ${where} ORDER BY created_at DESC`).all(guildId);
+  const archivedCount = mode === 'archived' ? all.length : db.prepare('SELECT COUNT(*) c FROM surveys WHERE guild_id = ? AND archived = 1').get(guildId).c;
+  const templateCount = mode === 'templates' ? all.length : db.prepare('SELECT COUNT(*) c FROM surveys WHERE guild_id = ? AND is_template = 1').get(guildId).c;
+
+  const titles = { active: '📋 Gestion des enquêtes', archived: '🗄️ Enquêtes archivées', templates: '📑 Modèles réutilisables' };
+  const emptyTexts = {
+    active: "Aucune enquête n'a encore été créée sur ce serveur.",
+    archived: 'Aucune enquête archivée sur ce serveur.',
+    templates: 'Aucun modèle réutilisable sur ce serveur.'
+  };
 
   const embed = new EmbedBuilder()
-    .setColor(archived ? 0x99aab5 : 0x5865f2)
-    .setTitle(archived ? '🗄️ Enquêtes archivées' : '📋 Gestion des enquêtes')
-    .setDescription(
-      all.length
-        ? `${all.length} enquête(s)${archived ? ' archivée(s)' : ''} sur ce serveur — choisis-en une ci-dessous pour la gérer.`
-        : archived
-          ? "Aucune enquête archivée sur ce serveur."
-          : "Aucune enquête n'a encore été créée sur ce serveur."
-    );
+    .setColor(mode === 'archived' ? 0x99aab5 : mode === 'templates' ? 0xeb459e : 0x5865f2)
+    .setTitle(titles[mode])
+    .setDescription(all.length ? `${all.length} enquête(s) — choisis-en une ci-dessous pour la gérer.` : emptyTexts[mode]);
 
   const components = [];
-  if (!archived) {
+  if (mode === 'active') {
     components.push(new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('cfg:new_survey').setLabel('Nouvelle enquête').setStyle(ButtonStyle.Success).setEmoji('🆕')));
   }
 
@@ -873,30 +898,34 @@ async function showSurveyManagementPanel(interaction, page = 0, archived = false
     const pageItems = all.slice(page * SURVEYS_PER_PAGE, page * SURVEYS_PER_PAGE + SURVEYS_PER_PAGE);
 
     const statusEmoji = { draft: '📝', active: '🟢', closed: '🔴' };
+    const modeTag = { active: null, archived: '🗄️ archivée', templates: '📑 modèle' };
     const select = new StringSelectMenuBuilder()
       .setCustomId('cfg:survey:select')
       .setPlaceholder('Choisis une enquête à gérer')
-      .addOptions(pageItems.map(s => ({ label: s.name.slice(0, 100), description: archived ? '🗄️ archivée' : `${statusEmoji[s.status] || ''} ${s.status}`, value: String(s.id) })));
+      .addOptions(pageItems.map(s => ({ label: s.name.slice(0, 100), description: modeTag[mode] || `${statusEmoji[s.status] || ''} ${s.status}`, value: String(s.id) })));
     components.push(new ActionRowBuilder().addComponents(select));
 
     if (totalPages > 1) {
+      const modeArg = mode === 'archived' ? '1' : mode === 'templates' ? '2' : '0';
       components.push(
         new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId(`cfg:survey:list:${page - 1}:${archived ? 1 : 0}`).setLabel('◀️').setStyle(ButtonStyle.Secondary).setDisabled(page === 0),
-          new ButtonBuilder().setCustomId(`cfg:survey:list:${page + 1}:${archived ? 1 : 0}`).setLabel('▶️').setStyle(ButtonStyle.Secondary).setDisabled(page >= totalPages - 1)
+          new ButtonBuilder().setCustomId(`cfg:survey:list:${page - 1}:${modeArg}`).setLabel('◀️').setStyle(ButtonStyle.Secondary).setDisabled(page === 0),
+          new ButtonBuilder().setCustomId(`cfg:survey:list:${page + 1}:${modeArg}`).setLabel('▶️').setStyle(ButtonStyle.Secondary).setDisabled(page >= totalPages - 1)
         )
       );
       embed.setFooter({ text: `Page ${page + 1}/${totalPages} • ${all.length} enquête(s)` });
     }
   }
 
-  const navRow = new ActionRowBuilder().addComponents(
-    archived
-      ? new ButtonBuilder().setCustomId('cfg:surveys').setLabel('⬅️ Enquêtes actives').setStyle(ButtonStyle.Secondary)
-      : new ButtonBuilder().setCustomId('cfg:surveys:archived').setLabel(`🗄️ Archivées (${archivedCount})`).setStyle(ButtonStyle.Secondary).setDisabled(!archivedCount),
-    new ButtonBuilder().setCustomId('cfg:back').setLabel('⬅️ Retour').setStyle(ButtonStyle.Secondary)
-  );
-  components.push(navRow);
+  const navButtons = [];
+  if (mode === 'active') {
+    navButtons.push(new ButtonBuilder().setCustomId('cfg:surveys:archived').setLabel(`🗄️ Archivées (${archivedCount})`).setStyle(ButtonStyle.Secondary).setDisabled(!archivedCount));
+    navButtons.push(new ButtonBuilder().setCustomId('cfg:surveys:templates').setLabel(`📑 Modèles (${templateCount})`).setStyle(ButtonStyle.Secondary).setDisabled(!templateCount));
+  } else {
+    navButtons.push(new ButtonBuilder().setCustomId('cfg:surveys').setLabel('⬅️ Enquêtes actives').setStyle(ButtonStyle.Secondary));
+  }
+  navButtons.push(new ButtonBuilder().setCustomId('cfg:back').setLabel('⬅️ Retour').setStyle(ButtonStyle.Secondary));
+  components.push(new ActionRowBuilder().addComponents(navButtons));
 
   await interaction.update({ embeds: [embed], components });
 }
@@ -957,10 +986,10 @@ async function createSurvey(interaction, templateId) {
 
   const info = db
     .prepare(
-      `INSERT INTO surveys (guild_id, name, description, max_responses_per_user, status, close_at, created_by, created_at)
-       VALUES (?, ?, ?, ?, 'draft', ?, ?, ?)`
+      `INSERT INTO surveys (guild_id, name, description, max_responses_per_user, status, anonymity_modes, close_at, created_by, created_at)
+       VALUES (?, ?, ?, ?, 'draft', ?, ?, ?, ?)`
     )
-    .run(interaction.guildId, name, description, max, closeAt, interaction.user.id, Date.now());
+    .run(interaction.guildId, name, description, max, JSON.stringify(['semi']), closeAt, interaction.user.id, Date.now());
 
   const surveyId = info.lastInsertRowid;
 
@@ -978,40 +1007,58 @@ async function createSurvey(interaction, templateId) {
   await respondPreferUpdate(interaction, buildAnonymityStepPayload(surveyId, warning));
 }
 
-function buildPrivacyModeRow(surveyId) {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`survey:anonmode:${surveyId}:public`).setLabel('Publique').setStyle(ButtonStyle.Primary).setEmoji('🌐'),
-    new ButtonBuilder().setCustomId(`survey:anonmode:${surveyId}:semi`).setLabel('Semi-privé').setStyle(ButtonStyle.Primary).setEmoji('🛡️'),
-    new ButtonBuilder().setCustomId(`survey:anonmode:${surveyId}:private`).setLabel('Privé').setStyle(ButtonStyle.Primary).setEmoji('🙈'),
-    new ButtonBuilder().setCustomId(`survey:anonmode:${surveyId}:choice`).setLabel('Au choix').setStyle(ButtonStyle.Primary).setEmoji('🎭')
-  );
+const PRIVACY_OPTION_EMOJI = { public: '🌐', semi: '🛡️', private: '🙈' };
+const PRIVACY_OPTION_LABEL = { public: 'Publique', semi: 'Semi-privé', private: 'Privé' };
+
+// Un seul <select> à choix multiple (1 à 3 parmi Publique/Semi-privé/Privé).
+// 1 seul coché = comportement figé. Plusieurs = chaque membre choisit parmi
+// exactement ceux-là en répondant.
+function buildPrivacyModeSelect(surveyId, selectedModes = ['semi']) {
+  const select = new StringSelectMenuBuilder()
+    .setCustomId(`survey:anonmode:${surveyId}`)
+    .setPlaceholder('Choisis un ou plusieurs modes')
+    .setMinValues(1)
+    .setMaxValues(3)
+    .addOptions(
+      ['public', 'semi', 'private'].map(m => ({
+        label: PRIVACY_OPTION_LABEL[m],
+        value: m,
+        emoji: PRIVACY_OPTION_EMOJI[m],
+        default: selectedModes.includes(m)
+      }))
+    );
+  return new ActionRowBuilder().addComponents(select);
 }
 
-function buildAnonymityStepPayload(surveyId, prefix = '') {
+function buildAnonymityStepPayload(surveyId, prefix = '', selectedModes = ['semi']) {
   const embed = new EmbedBuilder()
     .setColor(0x57f287)
     .setTitle('🔒 Confidentialité des réponses')
     .setDescription(
-      `${prefix}Comment les réponses à cette enquête doivent-elles être enregistrées ?\n\n` +
+      `${prefix}Choisis un ou plusieurs modes de confidentialité pour cette enquête :\n\n` +
         '🌐 **Publique** — le nom du répondant est affiché dans les stats\n' +
         '🛡️ **Semi-privé** — le nom n\'est visible que du staff (sert aussi à limiter les doublons)\n' +
-        '🙈 **Privé** — aucun nom conservé, donc réponses illimitées par personne\n' +
-        '🎭 **Au choix** — chaque membre choisit entre Publique et Semi-privé'
+        '🙈 **Privé** — aucun nom conservé, réponses illimitées par personne\n\n' +
+        'Si tu en coches **plusieurs**, chaque membre choisira son mode préféré parmi ceux-là en répondant.'
     );
 
-  return { embeds: [embed], components: [buildPrivacyModeRow(surveyId)] };
+  return { embeds: [embed], components: [buildPrivacyModeSelect(surveyId, selectedModes)] };
 }
 
 // Utilisé à la création ET pour modifier la confidentialité depuis le builder/dashboard.
-async function handleAnonymityModeChoice(interaction, surveyId, mode) {
-  // Le mode "Privé" ne conserve aucune identité : la limite de réponses par
-  // utilisateur ne peut donc plus être garantie, on la force à illimité.
-  if (mode === 'private') {
-    db.prepare('UPDATE surveys SET anonymity_mode = ?, max_responses_per_user = 0 WHERE id = ?').run(mode, surveyId);
+// interaction.values = tableau de 1 à 3 modes choisis dans le <select>.
+async function handleAnonymityModeChoice(interaction, surveyId) {
+  const modes = interaction.values;
+  const primary = modes.length === 1 ? modes[0] : 'choice'; // conservé pour affichage/compat
+  // Dès que "Privé" est l'une des options proposées, la limite de réponses par
+  // utilisateur ne peut plus être garantie pour tout le monde (un membre peut
+  // toujours choisir Privé pour la contourner) : on la force à illimité.
+  if (modes.includes('private')) {
+    db.prepare('UPDATE surveys SET anonymity_modes = ?, anonymity_mode = ?, max_responses_per_user = 0 WHERE id = ?').run(JSON.stringify(modes), primary, surveyId);
   } else {
-    db.prepare('UPDATE surveys SET anonymity_mode = ? WHERE id = ?').run(mode, surveyId);
+    db.prepare('UPDATE surveys SET anonymity_modes = ?, anonymity_mode = ? WHERE id = ?').run(JSON.stringify(modes), primary, surveyId);
   }
-  logs.logFromInteraction(interaction, 'survey.edit', `confidentialité = ${mode}`);
+  logs.logFromInteraction(interaction, 'survey.edit', `confidentialité = ${modes.join(' + ')}`);
 
   const survey = db.prepare('SELECT * FROM surveys WHERE id = ?').get(surveyId);
   if (survey.status === 'draft') {
@@ -1024,18 +1071,20 @@ async function handleAnonymityModeChoice(interaction, surveyId, mode) {
 }
 
 async function showAnonymityChooserButton(interaction, surveyId) {
+  const survey = db.prepare('SELECT * FROM surveys WHERE id = ?').get(surveyId);
+  const current = getAnonymityModes(survey);
   const embed = new EmbedBuilder()
     .setColor(0x5865f2)
     .setTitle('🔒 Confidentialité des réponses')
     .setDescription(
-      "Comment les réponses à cette enquête doivent-elles être enregistrées ?\n\n" +
+      "Choisis un ou plusieurs modes de confidentialité pour cette enquête :\n\n" +
         '🌐 **Publique** — nom affiché dans les stats\n' +
         '🛡️ **Semi-privé** — nom visible du staff uniquement\n' +
-        '🙈 **Privé** — aucun nom conservé, réponses illimitées\n' +
-        '🎭 **Au choix** — le membre choisit entre Publique et Semi-privé\n\n' +
-        "⚠️ Passer en **Privé** réinitialisera la limite de réponses par utilisateur à illimité."
+        '🙈 **Privé** — aucun nom conservé, réponses illimitées\n\n' +
+        'Plusieurs modes cochés = chaque membre choisit parmi ceux-là en répondant.\n\n' +
+        "⚠️ Activer **Privé** réinitialisera la limite de réponses par utilisateur à illimité."
     );
-  await interaction.update({ embeds: [embed], components: [buildPrivacyModeRow(surveyId)] });
+  await interaction.update({ embeds: [embed], components: [buildPrivacyModeSelect(surveyId, current)] });
 }
 
 const TYPE_EMOJI = { texte: '📝', nombre: '🔢', choix: '🔘' };
@@ -1058,12 +1107,15 @@ function buildSurveyBuilderPanel(surveyId) {
 
   const embed = new EmbedBuilder()
     .setColor(0x57f287)
-    .setTitle(`🛠️ Construction : ${survey.name}`)
-    .setDescription(survey.description || '*Pas de description*')
+    .setTitle(`🛠️ Construction : ${survey.is_template ? '📑 [Modèle] ' : ''}${survey.name}`)
+    .setDescription(
+      (survey.is_template ? "📑 **Ceci est un modèle réutilisable** : il ne peut pas être publié tel quel. Duplique-le pour créer une vraie enquête à partir de ce modèle.\n\n" : '') +
+        (survey.description || '*Pas de description*')
+    )
     .addFields(
       { name: `Questions (${questions.length})`, value: qList },
       { name: 'Réponses max / utilisateur', value: survey.max_responses_per_user === 0 ? 'Illimité' : String(survey.max_responses_per_user), inline: true },
-      { name: 'Anonymat', value: ANONYMITY_LABELS[survey.anonymity_mode] || survey.anonymity_mode, inline: true },
+      { name: 'Confidentialité', value: describeAnonymityModes(getAnonymityModes(survey)), inline: true },
       { name: 'Clôture auto', value: survey.close_at ? `<t:${Math.floor(survey.close_at / 1000)}:f>` : 'Aucune', inline: true }
     );
 
@@ -1084,8 +1136,16 @@ function buildSurveyBuilderPanel(surveyId) {
       .setLabel('Publier')
       .setStyle(ButtonStyle.Success)
       .setEmoji('🚀')
-      .setDisabled(questions.length === 0)
+      .setDisabled(questions.length === 0 || !!survey.is_template),
+    new ButtonBuilder()
+      .setCustomId(`survey:template:toggle:${surveyId}`)
+      .setLabel(survey.is_template ? 'Retirer du statut modèle' : 'Marquer comme modèle')
+      .setStyle(survey.is_template ? ButtonStyle.Secondary : ButtonStyle.Primary)
+      .setEmoji('📑')
   );
+  if (survey.is_template) {
+    row3.addComponents(new ButtonBuilder().setCustomId(`survey:duplicate:${surveyId}`).setLabel('Dupliquer en nouvelle enquête').setStyle(ButtonStyle.Success).setEmoji('🆕'));
+  }
 
   const components = [row1, row2, row3];
 
@@ -1162,7 +1222,7 @@ async function previewSurvey(interaction, surveyId) {
   const questions = db.prepare('SELECT * FROM questions WHERE survey_id = ? ORDER BY position ASC').all(surveyId);
 
   if (!questions.length) {
-    return interaction.reply({ content: '❌ Ajoute au moins une question avant de prévisualiser.', ephemeral: true });
+    return interaction.reply({ content: '❌ Ajoute au moins une question avant de prévisualiser.', flags: MessageFlags.Ephemeral });
   }
 
   await flow.startResponseFlow(interaction, survey, true);
@@ -1191,7 +1251,7 @@ async function saveCloseAt(interaction, surveyId) {
   if (raw) {
     closeAt = parseDateTimeFR(raw);
     if (!closeAt) {
-      return interaction.reply({ content: '❌ Format invalide. Utilise JJ/MM/AAAA HH:MM (ex : 25/12/2026 18:00).', ephemeral: true });
+      return interaction.reply({ content: '❌ Format invalide. Utilise JJ/MM/AAAA HH:MM (ex : 25/12/2026 18:00).', flags: MessageFlags.Ephemeral });
     }
   }
 
@@ -1225,7 +1285,7 @@ async function startAddQuestion(interaction, surveyId) {
 
 async function startEditQuestion(interaction, surveyId, questionId) {
   const q = db.prepare('SELECT * FROM questions WHERE id = ?').get(questionId);
-  if (!q) return interaction.reply({ content: '❌ Question introuvable.', ephemeral: true });
+  if (!q) return interaction.reply({ content: '❌ Question introuvable.', flags: MessageFlags.Ephemeral });
 
   questionDrafts.set(draftKey(interaction.user.id, surveyId), {
     mode: 'edit',
@@ -1256,7 +1316,7 @@ async function showTypeStep(interaction, surveyId) {
 
 async function handleTypeChoice(interaction, surveyId, type) {
   const draft = questionDrafts.get(draftKey(interaction.user.id, surveyId));
-  if (!draft) return interaction.reply({ content: '❌ Session expirée, relance la création de la question.', ephemeral: true });
+  if (!draft) return interaction.reply({ content: '❌ Session expirée, relance la création de la question.', flags: MessageFlags.Ephemeral });
   draft.type = type;
 
   const embed = new EmbedBuilder()
@@ -1278,7 +1338,7 @@ async function handleTypeChoice(interaction, surveyId, type) {
 // gérées comme de simples champs texte du modal).
 async function handleRequiredChoice(interaction, surveyId, requiredValue) {
   const draft = questionDrafts.get(draftKey(interaction.user.id, surveyId));
-  if (!draft) return interaction.reply({ content: '❌ Session expirée, relance la création de la question.', ephemeral: true });
+  if (!draft) return interaction.reply({ content: '❌ Session expirée, relance la création de la question.', flags: MessageFlags.Ephemeral });
   draft.required = requiredValue === 'oui' ? 1 : 0;
 
   if (draft.type === 'texte') {
@@ -1301,7 +1361,7 @@ async function showFormatStep(interaction, surveyId) {
 
 async function handleFormatChoice(interaction, surveyId, value) {
   const draft = questionDrafts.get(draftKey(interaction.user.id, surveyId));
-  if (!draft) return interaction.reply({ content: '❌ Session expirée, relance la création de la question.', ephemeral: true });
+  if (!draft) return interaction.reply({ content: '❌ Session expirée, relance la création de la question.', flags: MessageFlags.Ephemeral });
   draft.multiline = value === 'multi' ? 1 : 0;
   await showFinalQuestionModal(interaction, surveyId, draft);
 }
@@ -1392,11 +1452,11 @@ function parseTypeSpecificFields(interaction, draft) {
 async function addQuestion(interaction, surveyId) {
   const key = draftKey(interaction.user.id, surveyId);
   const draft = questionDrafts.get(key);
-  if (!draft) return interaction.reply({ content: '❌ Session expirée, relance la création de la question.', ephemeral: true });
+  if (!draft) return interaction.reply({ content: '❌ Session expirée, relance la création de la question.', flags: MessageFlags.Ephemeral });
 
   const label = interaction.fields.getTextInputValue('label').trim();
   const parsed = parseTypeSpecificFields(interaction, draft);
-  if (!parsed.ok) return interaction.reply({ content: parsed.message, ephemeral: true });
+  if (!parsed.ok) return interaction.reply({ content: parsed.message, flags: MessageFlags.Ephemeral });
 
   const pos = db.prepare('SELECT COALESCE(MAX(position), -1) + 1 p FROM questions WHERE survey_id = ?').get(surveyId).p;
   db.prepare(
@@ -1414,12 +1474,12 @@ async function editQuestion(interaction, surveyId) {
   const key = draftKey(interaction.user.id, surveyId);
   const draft = questionDrafts.get(key);
   if (!draft || draft.mode !== 'edit') {
-    return interaction.reply({ content: '❌ Session expirée, relance la modification.', ephemeral: true });
+    return interaction.reply({ content: '❌ Session expirée, relance la modification.', flags: MessageFlags.Ephemeral });
   }
 
   const label = interaction.fields.getTextInputValue('label').trim();
   const parsed = parseTypeSpecificFields(interaction, draft);
-  if (!parsed.ok) return interaction.reply({ content: parsed.message, ephemeral: true });
+  if (!parsed.ok) return interaction.reply({ content: parsed.message, flags: MessageFlags.Ephemeral });
 
   db.prepare(
     'UPDATE questions SET label = ?, type = ?, options = ?, required = ?, multiline = ?, min_value = ?, max_value = ?, min_select = ?, max_select = ? WHERE id = ?'
@@ -1475,17 +1535,97 @@ async function showQuestionManagePanel(interaction, surveyId, questionId) {
     embed.addFields({ name: 'Options', value: truncateField(JSON.parse(q.options || '[]').join(', ')) || '*aucune*' });
   }
 
+  const eligibleConditionSources = db.prepare("SELECT COUNT(*) c FROM questions WHERE survey_id = ? AND type = 'choix' AND position < ?").get(surveyId, q.position).c;
+  if (q.condition_question_id) {
+    const srcQ = db.prepare('SELECT label FROM questions WHERE id = ?').get(q.condition_question_id);
+    embed.addFields({ name: '🔀 Condition d\'affichage', value: srcQ ? `Affichée seulement si « ${srcQ.label} » = **${q.condition_value}**` : '*question source supprimée — condition invalide*' });
+  }
+
   const moveRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`survey:moveq:${surveyId}:${questionId}:up`).setLabel('Monter').setStyle(ButtonStyle.Secondary).setEmoji('⬆️').setDisabled(isFirst),
     new ButtonBuilder().setCustomId(`survey:moveq:${surveyId}:${questionId}:down`).setLabel('Descendre').setStyle(ButtonStyle.Secondary).setEmoji('⬇️').setDisabled(isLast)
   );
   const actionRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`survey:editq:${surveyId}:${questionId}`).setLabel('Modifier').setStyle(ButtonStyle.Primary).setEmoji('✏️'),
-    new ButtonBuilder().setCustomId(`survey:delq2:${surveyId}:${questionId}`).setLabel('Supprimer').setStyle(ButtonStyle.Danger).setEmoji('🗑️')
+    new ButtonBuilder().setCustomId(`survey:delq2:${surveyId}:${questionId}`).setLabel('Supprimer').setStyle(ButtonStyle.Danger).setEmoji('🗑️'),
+    new ButtonBuilder()
+      .setCustomId(`survey:condq:${surveyId}:${questionId}`)
+      .setLabel('Condition')
+      .setStyle(ButtonStyle.Secondary)
+      .setEmoji('🔀')
+      .setDisabled(!eligibleConditionSources && !q.condition_question_id)
   );
   const back = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`survey:builder:${surveyId}`).setLabel('⬅️ Retour').setStyle(ButtonStyle.Secondary));
 
   await interaction.update({ embeds: [embed], components: [moveRow, actionRow, back] });
+}
+
+/* ------------------- Questions conditionnelles (logique de saut) ------------------- */
+
+async function showConditionPicker(interaction, surveyId, questionId) {
+  const q = db.prepare('SELECT * FROM questions WHERE id = ?').get(questionId);
+  const eligible = db.prepare("SELECT * FROM questions WHERE survey_id = ? AND type = 'choix' AND position < ? ORDER BY position ASC").all(surveyId, q.position);
+
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle('🔀 Condition d\'affichage')
+    .setDescription(
+      `Choisis la question (à choix) dont dépend l'affichage de « ${q.label} ».\n` +
+        "Cette question ne sera posée au membre que s'il a choisi la bonne réponse à la question source."
+    );
+
+  const components = [];
+  if (eligible.length) {
+    const select = new StringSelectMenuBuilder()
+      .setCustomId(`survey:condq:pick:${surveyId}:${questionId}`)
+      .setPlaceholder('Question source')
+      .addOptions(eligible.slice(0, 25).map(eq => ({ label: eq.label.slice(0, 100), value: String(eq.id), default: eq.id === q.condition_question_id })));
+    components.push(new ActionRowBuilder().addComponents(select));
+  } else {
+    embed.addFields({ name: 'ℹ️', value: 'Aucune question à choix ne précède celle-ci.' });
+  }
+  if (q.condition_question_id) {
+    components.push(new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`survey:condq:clear:${surveyId}:${questionId}`).setLabel('Retirer la condition actuelle').setStyle(ButtonStyle.Danger)));
+  }
+  components.push(new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`survey:qmanage:${surveyId}:${questionId}`).setLabel('⬅️ Retour').setStyle(ButtonStyle.Secondary)));
+
+  await interaction.update({ embeds: [embed], components });
+}
+
+async function pickConditionSourceQuestion(interaction, surveyId, questionId) {
+  const sourceId = interaction.values[0];
+  const source = db.prepare('SELECT * FROM questions WHERE id = ?').get(sourceId);
+  const options = JSON.parse(source.options || '[]');
+
+  if (!options.length) {
+    return interaction.reply({ content: "❌ Cette question source n'a aucune option définie.", flags: MessageFlags.Ephemeral });
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle('🔀 Condition d\'affichage')
+    .setDescription(`Quelle réponse à « ${source.label} » doit déclencher l'affichage de cette question ?`);
+
+  const select = new StringSelectMenuBuilder()
+    .setCustomId(`survey:condq:value:${surveyId}:${questionId}:${sourceId}`)
+    .setPlaceholder('Valeur déclenchante')
+    .addOptions(options.slice(0, 25).map(opt => ({ label: String(opt).slice(0, 100), value: String(opt) })));
+
+  const back = new ButtonBuilder().setCustomId(`survey:condq:${surveyId}:${questionId}`).setLabel('⬅️ Retour').setStyle(ButtonStyle.Secondary);
+  await interaction.update({ embeds: [embed], components: [new ActionRowBuilder().addComponents(select), new ActionRowBuilder().addComponents(back)] });
+}
+
+async function setConditionValue(interaction, surveyId, questionId, sourceId) {
+  const value = interaction.values[0];
+  db.prepare('UPDATE questions SET condition_question_id = ?, condition_value = ? WHERE id = ?').run(sourceId, value, questionId);
+  logs.logFromInteraction(interaction, 'survey.edit', `condition ajoutée sur une question`);
+  await showQuestionManagePanel(interaction, surveyId, questionId);
+}
+
+async function clearCondition(interaction, surveyId, questionId) {
+  db.prepare('UPDATE questions SET condition_question_id = NULL, condition_value = NULL WHERE id = ?').run(questionId);
+  logs.logFromInteraction(interaction, 'survey.edit', `condition retirée d'une question`);
+  await showQuestionManagePanel(interaction, surveyId, questionId);
 }
 
 // Échange la position de la question avec sa voisine immédiate (haut/bas).
@@ -1549,23 +1689,43 @@ async function publishSurvey(interaction, surveyId) {
   const cfg = db.prepare('SELECT * FROM guild_config WHERE guild_id = ?').get(interaction.guildId);
 
   if (!cfg?.response_channel_id) {
-    return interaction.reply({ content: '❌ Configure d\'abord un salon de réponses (bouton "Salon des réponses" dans le panneau principal).', ephemeral: true });
+    return interaction.reply({ content: '❌ Configure d\'abord un salon de réponses (bouton "Salon des réponses" dans le panneau principal).', flags: MessageFlags.Ephemeral });
   }
 
   const channel = await interaction.guild.channels.fetch(cfg.response_channel_id).catch(() => null);
   if (!channel) {
-    return interaction.reply({ content: '❌ Le salon configuré est introuvable. Reconfigure-le.', ephemeral: true });
+    return interaction.reply({ content: '❌ Le salon configuré est introuvable. Reconfigure-le.', flags: MessageFlags.Ephemeral });
   }
 
-  db.prepare("UPDATE surveys SET status = 'active' WHERE id = ?").run(surveyId);
-  const updatedSurvey = db.prepare('SELECT * FROM surveys WHERE id = ?').get(surveyId);
-  const msg = await channel.send(messages.buildSurveyAnnouncementPayload(updatedSurvey));
+  // Vérification proactive des permissions du bot dans le salon, pour éviter
+  // de planter sur l'appel API et surtout de laisser l'enquête passer "active"
+  // en base alors qu'elle n'a jamais été réellement publiée.
+  const missing = messages.missingSendPermissions(channel, interaction.guild);
+  if (missing.length) {
+    return interaction.reply({
+      content: `❌ Il me manque des permissions dans <#${channel.id}> pour y publier : **${missing.join(', ')}**. Corrige mes permissions sur ce salon puis réessaie.`,
+      flags: MessageFlags.Ephemeral
+    });
+  }
 
-  db.prepare('UPDATE surveys SET channel_id = ?, message_id = ? WHERE id = ?').run(channel.id, msg.id, surveyId);
+  // On ne marque l'enquête "active" qu'une fois le message réellement envoyé,
+  // pour ne jamais laisser une enquête "active" sans message public associé.
+  let msg;
+  try {
+    msg = await channel.send(messages.buildSurveyAnnouncementPayload(survey));
+  } catch (err) {
+    logger.error("Échec de la publication de l'enquête :", err);
+    return interaction.reply({
+      content: err?.code === 50013 ? `❌ Discord a refusé l'envoi dans <#${channel.id}> (permissions manquantes). Vérifie mes permissions sur ce salon.` : "❌ La publication a échoué, l'enquête reste en brouillon. Réessaie dans un instant.",
+      flags: MessageFlags.Ephemeral
+    });
+  }
+
+  db.prepare("UPDATE surveys SET status = 'active', channel_id = ?, message_id = ? WHERE id = ?").run(channel.id, msg.id, surveyId);
   logs.logFromInteraction(interaction, 'survey.publish', survey.name);
 
   const { embed: mainEmbed, components } = buildMainPanel(interaction);
-  await interaction.reply({ content: `🚀 Enquête publiée dans <#${channel.id}> !`, embeds: [mainEmbed], components, ephemeral: true });
+  await interaction.reply({ content: `🚀 Enquête publiée dans <#${channel.id}> !`, embeds: [mainEmbed], components, flags: MessageFlags.Ephemeral });
 }
 
 /* ------------------------------------------------------------------ */
@@ -1602,7 +1762,7 @@ function buildDashboard(surveyId, page = 0) {
     { name: 'Statut', value: survey.archived ? '🗄️ Archivée' : survey.status === 'active' ? '🟢 Active' : '🔴 Fermée', inline: true },
     { name: 'Réponses reçues', value: String(responseCount), inline: true },
     { name: 'Réponses max/util.', value: survey.max_responses_per_user === 0 ? 'Illimité' : String(survey.max_responses_per_user), inline: true },
-    { name: 'Anonymat', value: ANONYMITY_LABELS[survey.anonymity_mode] || survey.anonymity_mode, inline: true },
+    { name: 'Confidentialité', value: describeAnonymityModes(getAnonymityModes(survey)), inline: true },
     { name: 'Salon', value: survey.channel_id ? `<#${survey.channel_id}>` : '—', inline: true },
     { name: 'Clôture auto', value: survey.close_at ? `<t:${Math.floor(survey.close_at / 1000)}:R>` : 'Aucune', inline: true }
   ];
@@ -1651,6 +1811,7 @@ function buildDashboard(surveyId, page = 0) {
   if (survey.archived) {
     const row1 = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(`survey:exporthtml:${surveyId}`).setLabel('HTML').setStyle(ButtonStyle.Secondary).setEmoji('📄'),
+      new ButtonBuilder().setCustomId(`survey:exportcsv:${surveyId}`).setLabel('CSV').setStyle(ButtonStyle.Secondary).setEmoji('📊'),
       new ButtonBuilder().setCustomId(`survey:charts:${surveyId}`).setLabel('Graphiques').setStyle(ButtonStyle.Secondary).setEmoji('📈')
     );
     const row2 = new ActionRowBuilder().addComponents(
@@ -1685,7 +1846,8 @@ function buildDashboard(surveyId, page = 0) {
         .setCustomId(`survey:selfedit:toggle:${surveyId}`)
         .setLabel(survey.allow_self_edit ? "Désactiver l'auto-modification" : "Autoriser l'auto-modification")
         .setStyle(survey.allow_self_edit ? ButtonStyle.Secondary : ButtonStyle.Success)
-        .setEmoji('✏️')
+        .setEmoji('✏️'),
+      new ButtonBuilder().setCustomId(`survey:advanced:${surveyId}`).setLabel('Avancé').setStyle(ButtonStyle.Secondary).setEmoji('🔧')
     );
 
     components.push(row1, row2, row3);
@@ -1743,6 +1905,136 @@ async function toggleSelfEdit(interaction, surveyId) {
 
   const { embed, components } = buildDashboard(surveyId);
   await interaction.update({ embeds: [embed], components });
+}
+
+/* ------------------------------------------------------------------ */
+/*  Panneau "Avancé" d'une enquête : rôle de récompense, rappel auto,   */
+/*  tirage au sort, modèle réutilisable.                                */
+/* ------------------------------------------------------------------ */
+
+function buildDashboardAdvanced(surveyId) {
+  const survey = db.prepare('SELECT * FROM surveys WHERE id = ?').get(surveyId);
+  const winnerCount = db.prepare('SELECT COUNT(*) c FROM raffle_winners WHERE survey_id = ?').get(surveyId).c;
+
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle(`🔧 Options avancées : ${survey.name}`)
+    .addFields(
+      { name: '🏆 Rôle de récompense', value: survey.reward_role_id ? `<@&${survey.reward_role_id}> (attribué à l'envoi d'une réponse)` : 'Aucun', inline: true },
+      {
+        name: '⏰ Rappel automatique',
+        value: survey.reminder_minutes_before
+          ? `${survey.reminder_minutes_before} min avant la clôture${survey.close_at ? '' : ' *(aucune clôture programmée : sans effet)*'}${survey.reminder_sent_at ? ' — déjà envoyé' : ''}`
+          : 'Désactivé',
+        inline: true
+      },
+      { name: '🎲 Tirage au sort', value: `${winnerCount} gagnant(s) déjà tiré(s)`, inline: true },
+      { name: '📑 Modèle réutilisable', value: survey.is_template ? '✅ Oui (dupliquée pour créer de vraies enquêtes)' : 'Non', inline: true }
+    );
+
+  const row1 = new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId(`survey:rewardrole:${surveyId}`).setPlaceholder('🏆 Choisir le rôle de récompense').setMaxValues(1));
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`survey:rewardrole:clear:${surveyId}`).setLabel('Retirer le rôle de récompense').setStyle(ButtonStyle.Secondary).setDisabled(!survey.reward_role_id),
+    new ButtonBuilder().setCustomId(`survey:reminder:${surveyId}`).setLabel('Configurer le rappel').setStyle(ButtonStyle.Secondary).setEmoji('⏰')
+  );
+  const row3 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`survey:exportcsv:${surveyId}`).setLabel('Export CSV').setStyle(ButtonStyle.Secondary).setEmoji('📊'),
+    new ButtonBuilder().setCustomId(`survey:exportbackup:${surveyId}`).setLabel('Sauvegarde JSON').setStyle(ButtonStyle.Secondary).setEmoji('💾'),
+    new ButtonBuilder().setCustomId(`survey:raffle:${surveyId}`).setLabel('Tirer un gagnant').setStyle(ButtonStyle.Primary).setEmoji('🎲'),
+    new ButtonBuilder()
+      .setCustomId(`survey:template:toggle:${surveyId}`)
+      .setLabel(survey.is_template ? 'Retirer du statut modèle' : 'Marquer comme modèle')
+      .setStyle(survey.is_template ? ButtonStyle.Secondary : ButtonStyle.Success)
+      .setEmoji('📑')
+  );
+  const back = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`survey:dash:page:${surveyId}:0`).setLabel('⬅️ Retour au tableau de bord').setStyle(ButtonStyle.Secondary));
+
+  return { embed, components: [row1, row2, row3, back] };
+}
+
+async function showDashboardAdvanced(interaction, surveyId) {
+  const { embed, components } = buildDashboardAdvanced(surveyId);
+  await interaction.update({ embeds: [embed], components });
+}
+
+async function setRewardRole(interaction, surveyId) {
+  const roleId = interaction.values[0];
+  const survey = db.prepare('SELECT name FROM surveys WHERE id = ?').get(surveyId);
+  db.prepare('UPDATE surveys SET reward_role_id = ? WHERE id = ?').run(roleId, surveyId);
+  logs.logFromInteraction(interaction, 'survey.edit', `${survey.name} — rôle de récompense -> <@&${roleId}>`);
+  const { embed, components } = buildDashboardAdvanced(surveyId);
+  await interaction.update({ embeds: [embed], components });
+}
+
+async function clearRewardRole(interaction, surveyId) {
+  const survey = db.prepare('SELECT name FROM surveys WHERE id = ?').get(surveyId);
+  db.prepare('UPDATE surveys SET reward_role_id = NULL WHERE id = ?').run(surveyId);
+  logs.logFromInteraction(interaction, 'survey.edit', `${survey.name} — rôle de récompense retiré`);
+  const { embed, components } = buildDashboardAdvanced(surveyId);
+  await interaction.update({ embeds: [embed], components });
+}
+
+async function showReminderModal(interaction, surveyId) {
+  const survey = db.prepare('SELECT reminder_minutes_before FROM surveys WHERE id = ?').get(surveyId);
+  const modal = new ModalBuilder().setCustomId(`survey:reminder:modal:${surveyId}`).setTitle('Rappel automatique');
+  const input = new TextInputBuilder()
+    .setCustomId('minutes')
+    .setLabel('Minutes avant la clôture (vide = désactivé)')
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false)
+    .setPlaceholder('Ex : 60');
+  if (survey.reminder_minutes_before) input.setValue(String(survey.reminder_minutes_before));
+  modal.addComponents(new ActionRowBuilder().addComponents(input));
+  await interaction.showModal(modal);
+}
+
+async function saveReminder(interaction, surveyId) {
+  const raw = interaction.fields.getTextInputValue('minutes')?.trim();
+  const minutes = raw ? parseInt(raw, 10) : null;
+  if (raw && (!Number.isFinite(minutes) || minutes <= 0)) {
+    return interaction.reply({ content: '❌ Indique un nombre de minutes positif, ou laisse vide pour désactiver.', flags: MessageFlags.Ephemeral });
+  }
+  const survey = db.prepare('SELECT name FROM surveys WHERE id = ?').get(surveyId);
+  db.prepare('UPDATE surveys SET reminder_minutes_before = ?, reminder_sent_at = NULL WHERE id = ?').run(minutes, surveyId);
+  logs.logFromInteraction(interaction, 'survey.edit', `${survey.name} — rappel -> ${minutes ? minutes + ' min avant clôture' : 'désactivé'}`);
+  const { embed, components } = buildDashboardAdvanced(surveyId);
+  await interaction.update({ embeds: [embed], components });
+}
+
+async function toggleTemplate(interaction, surveyId) {
+  const survey = db.prepare('SELECT * FROM surveys WHERE id = ?').get(surveyId);
+  const next = survey.is_template ? 0 : 1;
+  db.prepare('UPDATE surveys SET is_template = ? WHERE id = ?').run(next, surveyId);
+  logs.logFromInteraction(interaction, 'survey.edit', `${survey.name} — modèle réutilisable -> ${next ? 'oui' : 'non'}`);
+  const { embed, components } = buildDashboardAdvanced(surveyId);
+  await interaction.update({ embeds: [embed], components });
+}
+
+// Tire au sort un répondant non-anonyme n'ayant pas déjà gagné sur cette
+// enquête. Les réponses privées/anonymes ne peuvent pas être tirées (on ne
+// connaît aucune identité à annoncer).
+async function drawRaffleWinner(interaction, surveyId) {
+  const survey = db.prepare('SELECT * FROM surveys WHERE id = ?').get(surveyId);
+  const candidates = db
+    .prepare(
+      `SELECT DISTINCT user_id FROM responses
+       WHERE survey_id = ? AND is_anonymous = 0
+       AND user_id NOT IN (SELECT user_id FROM raffle_winners WHERE survey_id = ?)`
+    )
+    .all(surveyId, surveyId)
+    .map(r => r.user_id);
+
+  if (!candidates.length) {
+    const { embed, components } = buildDashboardAdvanced(surveyId);
+    return interaction.update({ embeds: [embed], components, content: "🎲 Plus aucun répondant éligible à tirer (tous déjà gagnants, ou aucune réponse non-anonyme)." });
+  }
+
+  const winnerId = candidates[Math.floor(Math.random() * candidates.length)];
+  db.prepare('INSERT INTO raffle_winners (survey_id, user_id, drawn_at) VALUES (?, ?, ?)').run(surveyId, winnerId, Date.now());
+  logs.logFromInteraction(interaction, 'survey.raffle', `${survey.name} — gagnant : <@${winnerId}>`);
+
+  const { embed, components } = buildDashboardAdvanced(surveyId);
+  await interaction.update({ embeds: [embed], components, content: `🎉 Gagnant tiré au sort pour **${survey.name}** : <@${winnerId}> !` });
 }
 
 async function archiveSurvey(interaction, surveyId) {
@@ -1803,17 +2095,38 @@ async function duplicateSurvey(interaction, surveyId) {
 
   const info = db
     .prepare(
-      `INSERT INTO surveys (guild_id, name, description, max_responses_per_user, status, anonymity_mode, close_at, created_by, created_at)
-       VALUES (?, ?, ?, ?, 'draft', ?, NULL, ?, ?)`
+      `INSERT INTO surveys (guild_id, name, description, max_responses_per_user, status, anonymity_mode, anonymity_modes, close_at, created_by, created_at, allow_self_delete, allow_self_edit, reward_role_id, reminder_minutes_before)
+       VALUES (?, ?, ?, ?, 'draft', ?, ?, NULL, ?, ?, ?, ?, ?, ?)`
     )
-    .run(survey.guild_id, `${survey.name} (copie)`, survey.description, survey.max_responses_per_user, survey.anonymity_mode, interaction.user.id, Date.now());
+    .run(
+      survey.guild_id,
+      `${survey.name} (copie)`,
+      survey.description,
+      survey.max_responses_per_user,
+      survey.anonymity_mode,
+      survey.anonymity_modes,
+      interaction.user.id,
+      Date.now(),
+      survey.allow_self_delete,
+      survey.allow_self_edit,
+      survey.reward_role_id,
+      survey.reminder_minutes_before
+    );
 
   const newSurveyId = info.lastInsertRowid;
   const insertQ = db.prepare(
     'INSERT INTO questions (survey_id, position, label, type, options, required, multiline, min_value, max_value, min_select, max_select) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
   );
+  const idMap = new Map(); // ancien id de question -> nouvel id, pour remapper la logique conditionnelle
   for (const q of questions) {
-    insertQ.run(newSurveyId, q.position, q.label, q.type, q.options, q.required, q.multiline, q.min_value, q.max_value, q.min_select, q.max_select);
+    const r = insertQ.run(newSurveyId, q.position, q.label, q.type, q.options, q.required, q.multiline, q.min_value, q.max_value, q.min_select, q.max_select);
+    idMap.set(q.id, r.lastInsertRowid);
+  }
+  const updateCondition = db.prepare('UPDATE questions SET condition_question_id = ?, condition_value = ? WHERE id = ?');
+  for (const q of questions) {
+    if (q.condition_question_id && idMap.has(q.condition_question_id)) {
+      updateCondition.run(idMap.get(q.condition_question_id), q.condition_value, idMap.get(q.id));
+    }
   }
 
   logs.logFromInteraction(interaction, 'survey.duplicate', `${survey.name} → ${survey.name} (copie)`);
@@ -1833,7 +2146,7 @@ async function exportSurveyHtml(interaction, surveyId) {
   const questions = db.prepare('SELECT * FROM questions WHERE survey_id = ? ORDER BY position ASC').all(surveyId);
   const responses = db.prepare('SELECT * FROM responses WHERE survey_id = ? ORDER BY created_at ASC').all(surveyId);
 
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
   // Récupère le pseudo de chaque répondant (mis en cache pour éviter les doublons) et
   // le transforme en lien hypertexte vers discord.dog pour un lookup rapide de l'ID.
@@ -1900,6 +2213,176 @@ async function exportSurveyHtml(interaction, surveyId) {
   await interaction.editReply({ content: `📄 Export HTML de **${survey.name}** — ouvre le fichier dans un navigateur.`, files: [attachment] });
 }
 
+// Export CSV (ouvrable dans Excel/Google Sheets) : une ligne par réponse.
+async function exportSurveyCsv(interaction, surveyId) {
+  const survey = db.prepare('SELECT * FROM surveys WHERE id = ?').get(surveyId);
+  const questions = db.prepare('SELECT * FROM questions WHERE survey_id = ? ORDER BY position ASC').all(surveyId);
+  const responses = db.prepare('SELECT * FROM responses WHERE survey_id = ? ORDER BY created_at ASC').all(surveyId);
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  const usernameCache = new Map();
+  async function username(userId) {
+    if (usernameCache.has(userId)) return usernameCache.get(userId);
+    let label = userId;
+    try {
+      label = (await interaction.client.users.fetch(userId)).username;
+    } catch {
+      /* utilisateur introuvable : on garde l'ID */
+    }
+    usernameCache.set(userId, label);
+    return label;
+  }
+
+  const header = ['Utilisateur', 'ID utilisateur', 'Date', ...questions.map(q => q.label)].map(toCsvValue).join(';');
+  const lines = [header];
+  for (const r of responses) {
+    const answers = db.prepare('SELECT * FROM answers WHERE response_id = ?').all(r.id);
+    const byQ = Object.fromEntries(answers.map(a => [a.question_id, a.value]));
+    const userLabel = r.is_anonymous ? 'Anonyme' : await username(r.user_id);
+    const row = [userLabel, r.is_anonymous ? '' : r.user_id, new Date(r.created_at).toLocaleString('fr-FR'), ...questions.map(q => byQ[q.id] ?? '')];
+    lines.push(row.map(toCsvValue).join(';'));
+  }
+
+  // BOM UTF-8 pour qu'Excel détecte correctement l'encodage des accents.
+  const csv = '\uFEFF' + lines.join('\r\n');
+  const attachment = new AttachmentBuilder(Buffer.from(csv, 'utf-8'), { name: `${survey.name.replace(/[^a-z0-9]+/gi, '_')}.csv` });
+
+  logs.logFromInteraction(interaction, 'survey.export', `${survey.name} (CSV)`);
+  await interaction.editReply({ content: `📊 Export CSV de **${survey.name}** — ouvrable directement dans Excel/Google Sheets.`, files: [attachment] });
+}
+
+/* ------------------------------------------------------------------ */
+/*  Sauvegarde / restauration (export JSON complet d'une enquête)       */
+/* ------------------------------------------------------------------ */
+
+const BACKUP_FORMAT = 'surveybot-backup-v1';
+
+async function exportSurveyBackup(interaction, surveyId) {
+  const survey = db.prepare('SELECT * FROM surveys WHERE id = ?').get(surveyId);
+  const questions = db.prepare('SELECT * FROM questions WHERE survey_id = ? ORDER BY position ASC').all(surveyId);
+  const qLabelById = new Map(questions.map(q => [q.id, q.label]));
+  const responses = db.prepare('SELECT * FROM responses WHERE survey_id = ?').all(surveyId);
+  const getAnswers = db.prepare('SELECT a.value AS value, q.label AS label FROM answers a JOIN questions q ON a.question_id = q.id WHERE a.response_id = ?');
+
+  const backup = {
+    format: BACKUP_FORMAT,
+    exportedAt: Date.now(),
+    survey: {
+      name: survey.name,
+      description: survey.description,
+      max_responses_per_user: survey.max_responses_per_user,
+      anonymity_modes: getAnonymityModes(survey),
+      allow_self_delete: !!survey.allow_self_delete,
+      allow_self_edit: !!survey.allow_self_edit,
+      reminder_minutes_before: survey.reminder_minutes_before
+    },
+    questions: questions.map(q => ({
+      label: q.label,
+      type: q.type,
+      options: q.options ? JSON.parse(q.options) : null,
+      required: !!q.required,
+      multiline: !!q.multiline,
+      min_value: q.min_value,
+      max_value: q.max_value,
+      min_select: q.min_select,
+      max_select: q.max_select,
+      condition_label: q.condition_question_id ? qLabelById.get(q.condition_question_id) || null : null,
+      condition_value: q.condition_value
+    })),
+    responses: responses.map(r => ({
+      user_id: r.is_anonymous ? null : r.user_id,
+      is_anonymous: !!r.is_anonymous,
+      is_public: r.is_public === null || r.is_public === undefined ? null : !!r.is_public,
+      created_at: r.created_at,
+      answers: getAnswers.all(r.id)
+    }))
+  };
+
+  const attachment = new AttachmentBuilder(Buffer.from(JSON.stringify(backup, null, 2), 'utf-8'), {
+    name: `${survey.name.replace(/[^a-z0-9]+/gi, '_')}_backup.json`
+  });
+  logs.logFromInteraction(interaction, 'survey.export', `${survey.name} (sauvegarde JSON)`);
+  await interaction.reply({
+    content: `💾 Sauvegarde complète de **${survey.name}** — contient les réponses et identifiants Discord des membres : garde ce fichier privé. Restaure-la avec \`/dashboard restaurer\`.`,
+    files: [attachment],
+    flags: MessageFlags.Ephemeral
+  });
+}
+
+async function restoreSurveyFromBackup(interaction, attachment) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  let backup;
+  try {
+    const res = await fetch(attachment.url);
+    backup = await res.json();
+  } catch (err) {
+    logger.warn('Échec de lecture du fichier de sauvegarde :', err);
+    return interaction.editReply('❌ Impossible de lire ce fichier — vérifie que c\'est bien un .json exporté depuis "💾 Sauvegarde JSON".');
+  }
+
+  if (backup?.format !== BACKUP_FORMAT || !backup.survey || !Array.isArray(backup.questions)) {
+    return interaction.editReply('❌ Ce fichier ne correspond pas au format de sauvegarde attendu.');
+  }
+
+  const s = backup.survey;
+  const info = db
+    .prepare(
+      `INSERT INTO surveys (guild_id, name, description, max_responses_per_user, status, anonymity_mode, anonymity_modes, created_by, created_at, allow_self_delete, allow_self_edit, reminder_minutes_before)
+       VALUES (?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      interaction.guildId,
+      `${s.name} (restaurée)`,
+      s.description || null,
+      s.max_responses_per_user ?? 1,
+      Array.isArray(s.anonymity_modes) && s.anonymity_modes.length === 1 ? s.anonymity_modes[0] : 'choice',
+      JSON.stringify(Array.isArray(s.anonymity_modes) && s.anonymity_modes.length ? s.anonymity_modes : ['semi']),
+      interaction.user.id,
+      Date.now(),
+      s.allow_self_delete === false ? 0 : 1,
+      s.allow_self_edit === false ? 0 : 1,
+      s.reminder_minutes_before ?? null
+    );
+  const newSurveyId = info.lastInsertRowid;
+
+  const idByLabel = new Map();
+  const insertQ = db.prepare(
+    'INSERT INTO questions (survey_id, position, label, type, options, required, multiline, min_value, max_value, min_select, max_select) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  );
+  backup.questions.forEach((q, i) => {
+    const r = insertQ.run(newSurveyId, i, q.label, q.type, q.options ? JSON.stringify(q.options) : null, q.required ? 1 : 0, q.multiline ? 1 : 0, q.min_value ?? null, q.max_value ?? null, q.min_select ?? 1, q.max_select ?? 1);
+    idByLabel.set(q.label, r.lastInsertRowid);
+  });
+  const updateCondition = db.prepare('UPDATE questions SET condition_question_id = ?, condition_value = ? WHERE id = ?');
+  backup.questions.forEach(q => {
+    if (q.condition_label && idByLabel.has(q.condition_label) && idByLabel.has(q.label)) {
+      updateCondition.run(idByLabel.get(q.condition_label), q.condition_value, idByLabel.get(q.label));
+    }
+  });
+
+  let restoredResponses = 0;
+  if (Array.isArray(backup.responses)) {
+    const insertR = db.prepare('INSERT INTO responses (survey_id, user_id, is_anonymous, is_public, created_at) VALUES (?, ?, ?, ?, ?)');
+    const insertA = db.prepare('INSERT INTO answers (response_id, question_id, value) VALUES (?, ?, ?)');
+    for (const r of backup.responses) {
+      const rInfo = insertR.run(newSurveyId, r.is_anonymous ? 'anonymous' : r.user_id, r.is_anonymous ? 1 : 0, r.is_public === null ? null : r.is_public ? 1 : 0, r.created_at || Date.now());
+      for (const a of r.answers || []) {
+        if (idByLabel.has(a.label) && a.value !== null && a.value !== undefined && a.value !== '') {
+          insertA.run(rInfo.lastInsertRowid, idByLabel.get(a.label), a.value);
+        }
+      }
+      restoredResponses++;
+    }
+  }
+
+  logs.logFromInteraction(interaction, 'survey.restore', `${s.name} (restaurée) — ${backup.questions.length} question(s), ${restoredResponses} réponse(s)`);
+  await interaction.editReply(
+    `✅ Enquête **${s.name} (restaurée)** recréée en brouillon avec ${backup.questions.length} question(s) et ${restoredResponses} réponse(s). Retrouve-la dans \`/dashboard enquete\` → 📋 Gestion des enquêtes.`
+  );
+}
+
 // Génère des graphiques en barres (via l'API publique QuickChart, aucune dépendance
 // locale) pour chaque question à choix, directement affichés en image dans Discord.
 async function showResultsCharts(interaction, surveyId) {
@@ -1907,7 +2390,7 @@ async function showResultsCharts(interaction, surveyId) {
   const questions = db.prepare("SELECT * FROM questions WHERE survey_id = ? AND type = 'choix' ORDER BY position ASC").all(surveyId);
 
   if (!questions.length) {
-    return interaction.reply({ content: "❌ Aucune question à choix multiples dans cette enquête : rien à représenter en graphique.", ephemeral: true });
+    return interaction.reply({ content: "❌ Aucune question à choix multiples dans cette enquête : rien à représenter en graphique.", flags: MessageFlags.Ephemeral });
   }
 
   const embeds = questions.slice(0, 4).map(q => {
@@ -1929,7 +2412,7 @@ async function showResultsCharts(interaction, surveyId) {
     embeds[embeds.length - 1].setFooter({ text: `+${questions.length - 4} autre(s) question(s) à choix non affichée(s) ici` });
   }
 
-  await interaction.reply({ content: `📈 Graphiques de **${survey.name}**`, embeds, ephemeral: true });
+  await interaction.reply({ content: `📈 Graphiques de **${survey.name}**`, embeds, flags: MessageFlags.Ephemeral });
 }
 
 /* ------------------------------------------------------------------ */
@@ -2020,7 +2503,7 @@ async function exportUserResponsesHtml(interaction, userId) {
     )
     .all(guildId, userId);
 
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
   let username = userId;
   try {
@@ -2094,8 +2577,29 @@ async function confirmDeleteUserData(interaction, userId) {
   await interaction.update({ embeds: [embed], components: [row] });
 }
 
+// Retire le rôle de récompense d'une enquête à un membre (best-effort, ne
+// doit jamais faire planter l'appelant). Utilisé partout où une réponse est
+// supprimée, en complément de l'attribution faite dans responseFlow.js.
+async function revokeRewardRoleIfAny(guild, survey, userId) {
+  if (!survey?.reward_role_id || !guild) return;
+  try {
+    const member = await guild.members.fetch(userId).catch(() => null);
+    if (member?.roles.cache.has(survey.reward_role_id)) {
+      await member.roles.remove(survey.reward_role_id).catch(() => {});
+    }
+  } catch {
+    /* best-effort */
+  }
+}
+
 async function executeDataUserDeletion(interaction, userId) {
   const guildId = interaction.guildId;
+  const affectedSurveys = db
+    .prepare(
+      `SELECT DISTINCT s.* FROM responses r JOIN surveys s ON r.survey_id = s.id
+       WHERE s.guild_id = ? AND r.user_id = ? AND r.is_anonymous = 0 AND s.reward_role_id IS NOT NULL`
+    )
+    .all(guildId, userId);
   const responseIds = db
     .prepare("SELECT r.id FROM responses r JOIN surveys s ON r.survey_id = s.id WHERE s.guild_id = ? AND r.user_id = ? AND r.is_anonymous = 0")
     .all(guildId, userId)
@@ -2113,6 +2617,8 @@ async function executeDataUserDeletion(interaction, userId) {
     embeds: [new EmbedBuilder().setColor(0x57f287).setTitle('✅ Données supprimées').setDescription(`${responseIds.length} réponse(s) de <@${userId}> ont été supprimées.`)],
     components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('cfg:data').setLabel('⬅️ Retour').setStyle(ButtonStyle.Secondary))]
   });
+
+  for (const s of affectedSurveys) await revokeRewardRoleIfAny(interaction.guild, s, userId);
 }
 
 /* --------------------- Actions sur une enquête --------------------- */
@@ -2432,6 +2938,7 @@ async function executeDeleteOwnResponse(interaction, surveyId) {
   try {
     const updated = db.prepare('SELECT * FROM surveys WHERE id = ?').get(surveyId);
     await messages.updatePublicMessageStats(interaction.client, updated);
+    await revokeRewardRoleIfAny(interaction.guild, updated, userId);
   } catch {
     // Rafraîchissement du message public best-effort : ne doit jamais faire planter.
   }
@@ -2522,6 +3029,10 @@ module.exports = {
   editQuestion,
   manageQuestionSelect,
   showQuestionManagePanel,
+  showConditionPicker,
+  pickConditionSourceQuestion,
+  setConditionValue,
+  clearCondition,
   moveQuestion,
   confirmDeleteQuestion,
   executeDeleteQuestion,
@@ -2535,6 +3046,16 @@ module.exports = {
   toggleSelfEdit,
   archiveSurvey,
   unarchiveSurvey,
+  showDashboardAdvanced,
+  setRewardRole,
+  clearRewardRole,
+  showReminderModal,
+  saveReminder,
+  toggleTemplate,
+  drawRaffleWinner,
+  exportSurveyCsv,
+  exportSurveyBackup,
+  restoreSurveyFromBackup,
   confirmDeleteSurvey,
   deleteSurvey,
   duplicateSurvey,

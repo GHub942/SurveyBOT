@@ -1,12 +1,13 @@
 {
   "name": "enquete-bot",
   "version": "1.0.0",
-  "description": "Bot Discord d'enquêtes paramétrable (panel /config + /enquete)",
+  "description": "Bot Discord d'enquêtes paramétrable (panel /dashboard + /enquete)",
   "main": "src/index.js",
   "type": "commonjs",
   "scripts": {
     "start": "node src/index.js",
-    "deploy": "node deploy-commands.js"
+    "deploy": "node src/scripts/commands.js deploy",
+    "clear": "node src/scripts/commands.js clear"
   },
   "engines": {
     "node": ">=22.5.0"
